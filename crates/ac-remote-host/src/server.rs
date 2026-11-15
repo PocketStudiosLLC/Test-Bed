@@ -550,18 +550,23 @@ impl Host {
                 loop {
                     // Watchdog: the client pings every 250 ms. If it goes
                     // quiet, release held keys long before QUIC gives up.
-                    let msg = match tokio::time::timeout(INPUT_WATCHDOG, read_msg::<ClientMsg>(&mut recv)).await {
-                        Ok(r) => match r? {
-                            Some(m) => m,
-                            None => break,
-                        },
-                        Err(_) => {
-                            if let Some(i) = host.injector.lock().unwrap().as_mut() {
-                                i.release_all();
+                    // The read stays in progress across watchdog ticks: dropping
+                    // it halfway through a message would lose the bytes it had
+                    // read, and every message after would be misread, so input
+                    // stopped for good while the video carried on.
+                    let read = read_msg::<ClientMsg>(&mut recv);
+                    tokio::pin!(read);
+                    let msg = loop {
+                        tokio::select! {
+                            r = &mut read => break r?,
+                            _ = tokio::time::sleep(INPUT_WATCHDOG) => {
+                                if let Some(i) = host.injector.lock().unwrap().as_mut() {
+                                    i.release_all();
+                                }
                             }
-                            continue;
                         }
                     };
+                    let Some(msg) = msg else { break };
                     // Someone at this PC comes first: drop the remote's input.
                     let inject = |f: &mut dyn FnMut(&mut Injector) -> Result<()>| {
                         if crate::local_input::active() {
