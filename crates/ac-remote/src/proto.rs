@@ -65,6 +65,15 @@ pub enum HostMsg {
     SwitchRefused { text: String },
 }
 
+/// Written after `Welcome` in the same frame (Test Bed 2.4+). Older viewers
+/// decode `Welcome` and ignore the bytes after it; a host that doesn't send
+/// it (older Test Bed, RemoteLinux) reads as `None`. New fields go at the end.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct HostExtras {
+    /// `std::env::consts::OS` on the host: "linux", "windows", …
+    pub os: String,
+}
+
 /// Maximum control message size; anything larger is a protocol error.
 const MAX_MSG: usize = 1 << 20;
 
@@ -77,8 +86,25 @@ pub async fn write_msg<T: Serialize>(w: &mut crate::net::SendStream, msg: &T) ->
     Ok(())
 }
 
+/// `msg` followed by `extra` in one frame: see [`HostExtras`].
+pub async fn write_msg_extra<T: Serialize, E: Serialize>(w: &mut crate::net::SendStream, msg: &T, extra: &E) -> Result<()> {
+    let mut body = postcard::to_stdvec(msg)?;
+    body.extend_from_slice(&postcard::to_stdvec(extra)?);
+    let mut buf = Vec::with_capacity(body.len() + 4);
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&body);
+    w.write_all(&buf).await?;
+    Ok(())
+}
+
 /// Read one message; `Ok(None)` on clean end of stream.
 pub async fn read_msg<T: DeserializeOwned>(r: &mut crate::net::RecvStream) -> Result<Option<T>> {
+    Ok(read_msg_extra::<T, ()>(r).await?.map(|(m, _)| m))
+}
+
+/// Read one message and whatever [`write_msg_extra`] put after it, if
+/// anything (`None` when the sender wrote a plain message).
+pub async fn read_msg_extra<T: DeserializeOwned, E: DeserializeOwned>(r: &mut crate::net::RecvStream) -> Result<Option<(T, Option<E>)>> {
     let mut len = [0u8; 4];
     if !r.read_exact_or_end(&mut len).await? {
         return Ok(None);
@@ -89,7 +115,13 @@ pub async fn read_msg<T: DeserializeOwned>(r: &mut crate::net::RecvStream) -> Re
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    Ok(Some(postcard::from_bytes(&body)?))
+    Ok(Some(decode_extra(&body)?))
+}
+
+fn decode_extra<T: DeserializeOwned, E: DeserializeOwned>(body: &[u8]) -> Result<(T, Option<E>)> {
+    let (msg, rest) = postcard::take_from_bytes(body)?;
+    let extra = if rest.is_empty() { None } else { postcard::from_bytes(rest).ok() };
+    Ok((msg, extra))
 }
 
 // ---- Files -------------------------------------------------------------------
@@ -265,5 +297,29 @@ mod tests {
             ClientMsg::Key { code: 30, pressed: true } => {}
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod extras_tests {
+    use super::*;
+
+    fn welcome() -> HostMsg {
+        HostMsg::Welcome { version: 1, host_name: "pc".into(), monitors: vec![] }
+    }
+
+    #[test]
+    fn welcome_with_and_without_extras() {
+        let plain = postcard::to_stdvec(&welcome()).unwrap();
+        let mut extended = plain.clone();
+        extended.extend(postcard::to_stdvec(&HostExtras { os: "windows".into() }).unwrap());
+
+        // A new viewer reads the host's OS, or none from an older host.
+        let (_, e) = decode_extra::<HostMsg, HostExtras>(&extended).unwrap();
+        assert_eq!(e.unwrap().os, "windows");
+        let (_, e) = decode_extra::<HostMsg, HostExtras>(&plain).unwrap();
+        assert!(e.is_none());
+        // An older viewer decodes Welcome alone and ignores the rest.
+        assert!(matches!(postcard::from_bytes::<HostMsg>(&extended).unwrap(), HostMsg::Welcome { .. }));
     }
 }

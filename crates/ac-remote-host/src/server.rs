@@ -11,7 +11,7 @@ use ac_remote::config::{ClientConfig, HostConfig};
 use ac_remote::identity::{Identity, Role};
 use ac_remote::net::{self, Conn};
 use ac_remote::pairing::{self, HostPairOutcome, PairingWindow};
-use ac_remote::proto::{read_msg, write_msg, ClientMsg, ClipMsg, HostMsg, Motion};
+use ac_remote::proto::{read_msg, write_msg, write_msg_extra, ClientMsg, ClipMsg, HostExtras, HostMsg, Motion};
 use ac_remote::transport::{self, ALPN_PAIR, ALPN_PROBE, ALPN_SESSION};
 use ac_remote::trust::{AuthorizedClient, AuthorizedClients, KnownHost, KnownHosts};
 use ac_remote::video::{fragment, FrameMeta};
@@ -364,7 +364,8 @@ impl Host {
             other => anyhow::bail!("expected Hello, got {other:?}"),
         };
         let monitors: Vec<_> = crate::monitors::list().map(|m| m.into_iter().map(|m| m.info).collect()).unwrap_or_default();
-        write_msg(&mut send, &HostMsg::Welcome { version: ac_remote::PROTOCOL_VERSION, host_name: self.name.clone(), monitors }).await?;
+        let welcome = HostMsg::Welcome { version: ac_remote::PROTOCOL_VERSION, host_name: self.name.clone(), monitors };
+        write_msg_extra(&mut send, &welcome, &HostExtras { os: std::env::consts::OS.into() }).await?;
 
         // One client at a time: a new connection from a paired client replaces
         // the old one (typically the same laptop reconnecting after a drop).

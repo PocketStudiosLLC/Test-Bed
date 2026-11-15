@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use crate::identity::Identity;
 use crate::net::Conn;
-use crate::proto::{read_msg, write_msg, ClientMsg, ClipMsg, HostMsg, MonitorInfo, Motion, StreamSettings};
+use crate::proto::{read_msg, read_msg_extra, write_msg, ClientMsg, ClipMsg, HostExtras, HostMsg, MonitorInfo, Motion, StreamSettings};
 use crate::transport::{self, ALPN_SESSION};
 use crate::trust::{KnownHost, KnownHosts};
 use crate::video::{FrameMeta, Reassembler};
@@ -31,7 +31,8 @@ const STALE_PARTIAL: Duration = Duration::from_millis(60);
 /// Events from the network side to the viewer.
 pub enum NetEvent {
     Connecting { attempt: u32 },
-    Connected { host_name: String, monitors: Vec<MonitorInfo> },
+    /// `host_os` is `std::env::consts::OS` on the host, if it said.
+    Connected { host_name: String, monitors: Vec<MonitorInfo>, host_os: Option<String> },
     Stream { monitor: String, width: u32, height: u32, fps: u32 },
     Frame { meta: FrameMeta, data: Vec<u8> },
     /// One Opus packet of desktop audio.
@@ -277,9 +278,12 @@ async fn run_session(
 ) -> Result<Ended> {
     let (mut send, mut recv) = conn.open_bi().await?;
     write_msg(&mut send, &ClientMsg::Hello { version: crate::PROTOCOL_VERSION, client_name: client_name.into(), settings: settings.clone() }).await?;
-    match tokio::time::timeout(Duration::from_secs(3), read_msg::<HostMsg>(&mut recv)).await.map_err(|_| anyhow!("host did not answer"))?? {
-        Some(HostMsg::Welcome { host_name, monitors, .. }) => events(NetEvent::Connected { host_name, monitors }),
-        Some(HostMsg::Error { text }) => return Ok(Ended::Fatal(text)),
+    let welcome = read_msg_extra::<HostMsg, HostExtras>(&mut recv);
+    match tokio::time::timeout(Duration::from_secs(3), welcome).await.map_err(|_| anyhow!("host did not answer"))?? {
+        Some((HostMsg::Welcome { host_name, monitors, .. }, extras)) => {
+            events(NetEvent::Connected { host_name, monitors, host_os: extras.map(|e| e.os) })
+        }
+        Some((HostMsg::Error { text }, _)) => return Ok(Ended::Fatal(text)),
         other => bail!("unexpected reply {other:?}"),
     }
     let known = if matches!(conn, Conn::Internet(_)) { KnownHosts::load_internet() } else { KnownHosts::load() };

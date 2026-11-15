@@ -348,15 +348,21 @@ impl TestBar {
         }
     }
 
-    pub fn set_run(self: &Rc<Self>, v: RunView) {
+    pub fn set_run(self: &Rc<Self>, mut v: RunView) {
         let was = self.run.borrow().active;
+        // A stopped run's folder stays a click away.
+        if !v.active && v.dir.as_os_str().is_empty() {
+            v.dir = self.run.borrow().dir.clone();
+        }
         *self.run.borrow_mut() = v.clone();
         self.run_name.set_sensitive(!v.active);
         self.run_button.set_label(if v.active { "Stop run" } else { "Start run" });
         let (on, off) = if v.active { ("destructive-action", "suggested-action") } else { ("suggested-action", "destructive-action") };
         self.run_button.remove_css_class(off);
         self.run_button.add_css_class(on);
-        self.open_run.set_visible(v.active);
+        self.open_run.set_visible(!v.dir.as_os_str().is_empty());
+        let what = if v.active { "Open this run's folder" } else { "Open the last run's folder" };
+        self.open_run.set_tooltip_text(Some(&format!("{what}\n{}", v.dir.display())));
         if v.active && !was {
             self.started.set(Some(Instant::now()));
             let b: Weak<Self> = Rc::downgrade(self);

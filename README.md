@@ -44,6 +44,11 @@ Both PCs run Test Bed on the same local network.
    and type the code. (Or use **Pair by address**.)
 3. Click **Connect**. The remote screen fills the PC tab. Buttons 1–4 switch
    between its monitors, and Fullscreen hides Test Bed's own bars.
+4. **Add a PC**, above the screen, goes back to the list to connect another
+   one; the connected PCs stay connected (a banner there leads back). Each PC
+   is a tile, like the phones: click one to give it the keyboard and mouse
+   (it gets an outline), and its magnifier button shows it alone until
+   **Show all**.
 
 While the remote PC has the keyboard, every key goes to it, Super shortcuts
 included. Ctrl+Alt+Shift with **Q** releases (click the picture to take it back),
@@ -141,8 +146,9 @@ no tile, and a welcome page shows while no phone is added.
 
 - **Test runs**: *Start run* saves, per phone, the full system log
   (`logcat.txt`), every crash and ANR with its stack trace (`crashes.txt`) and
-  the graphs (`stats.csv`) into one folder under `~/Documents/Android
-  Controller/Runs/`. *Stop run* adds a `summary.txt`. Change the folder in
+  the graphs (`stats.csv`) into one folder under `~/Documents/Test
+  Bed/Runs/`. *Stop run* adds a `summary.txt`. The folder button next to
+  *Start run* opens the current or last run. Change the folder in
   Preferences › Testing.
 - **Crash watch**: when an app crashes, freezes (ANR) or dies natively on a
   phone, its tile gets a red ⚠ count. Click it for the stack traces. On by

@@ -68,6 +68,8 @@ togglebutton.stay-awake:checked { color: @accent_color; background: alpha(@accen
 .perf-graph { border-radius: 4px; }
 .remote-bar { padding: 6px 12px; border-bottom: 1px solid alpha(currentColor, 0.1); }
 .remote-panel { background: alpha(@window_bg_color, 0.9); color: @window_fg_color; border-radius: 12px; padding: 12px 16px; }
+.pc-tile.card .remote-video { margin: 0 6px 6px 6px; }
+.pc-tile.selected { outline: 2px solid @accent_color; outline-offset: -2px; }
 togglebutton.record-toggle:checked { color: @error_color; background: alpha(@error_color, 0.15); }
 "#;
 
@@ -1410,11 +1412,19 @@ impl App {
         self.toasts.add_toast(t);
     }
 
+    /// Opens `folder` in the file manager. A FileLauncher, not a UriLauncher:
+    /// GTK 4.22 sends a folder's `file://` link through the portal's OpenURI,
+    /// which fails for local folders.
     pub fn open_folder(&self, folder: &std::path::Path) {
-        let uri = gtk::gio::File::for_path(folder).uri();
-        gtk::UriLauncher::new(&uri).launch(Some(&self.window), gtk::gio::Cancellable::NONE, |r| {
-            if let Err(e) = r {
-                tracing::warn!("opening the folder: {e}");
+        let file = gtk::gio::File::for_path(folder);
+        let (uri, toasts) = (file.uri(), self.toasts.clone());
+        let shown = folder.display().to_string();
+        gtk::FileLauncher::new(Some(&file)).launch(Some(&self.window), gtk::gio::Cancellable::NONE, move |r| {
+            let Err(e) = r else { return };
+            tracing::warn!("opening {shown} with the file launcher: {e}; trying the default app");
+            if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk::gio::AppLaunchContext>) {
+                tracing::warn!("opening {shown}: {e}");
+                toasts.add_toast(adw::Toast::builder().title(format!("Couldn't open the folder. It's {shown}")).timeout(10).build());
             }
         });
     }

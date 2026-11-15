@@ -10,6 +10,8 @@ use gtk::{gdk, glib};
 const CSS: &str = r#"
 .remote-bar { padding: 6px 12px; border-bottom: 1px solid alpha(currentColor, 0.1); }
 .remote-panel { background: alpha(@window_bg_color, 0.9); color: @window_fg_color; border-radius: 12px; padding: 12px 16px; }
+.pc-tile.card .remote-video { margin: 0 6px 6px 6px; }
+.pc-tile.selected { outline: 2px solid @accent_color; outline-offset: -2px; }
 .video-frame { border-radius: 16px; background: black; }
 .qr { border-radius: 12px; }
 "#;

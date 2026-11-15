@@ -5,6 +5,9 @@
 //! Ported from RemoteLinux, which Test Bed replaces:
 //! its pairings come along, and its host service is switched off.
 //!
+//! Several PCs can be connected at once: each is a tile in a grid, like the
+//! phones, and the one last clicked gets the keyboard and mouse.
+//!
 //! Sharing runs as the `test-bed-share` user service, so this PC can be
 //! reached from login on, whether or not Test Bed is open.
 
@@ -163,8 +166,19 @@ pub struct RemoteTab {
     computers: adw::PreferencesGroup,
     computer_rows: RefCell<Vec<gtk::Widget>>,
     refresh_button: gtk::Button,
-    viewer_slot: gtk::Box,
-    viewer: RefCell<Option<Rc<Viewer>>>,
+    /// The connected PCs' tiles.
+    grid: gtk::Grid,
+    add_strip: gtk::Box,
+    connected_label: gtk::Label,
+    show_all: gtk::Button,
+    /// On the list: back to the connected PCs.
+    banner: adw::Banner,
+    viewers: RefCell<Vec<Rc<Viewer>>>,
+    /// Fingerprint of the viewer with the keyboard and mouse.
+    selected: RefCell<Option<String>>,
+    /// Fingerprint of the one viewer shown alone (focus or fullscreen).
+    focused: RefCell<Option<String>>,
+    fullscreen: Cell<bool>,
     /// Set while the switch is moved by a refresh, not the user.
     syncing: Cell<bool>,
     refreshing: Cell<bool>,
@@ -238,10 +252,43 @@ impl RemoteTab {
         page.add(&computers);
         page.add(&remote);
 
-        let viewer_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let banner = adw::Banner::builder().button_label("Show").build();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        list.append(&banner);
+        list.append(&page);
+
+        let add_button = gtk::Button::builder()
+            .child(&adw::ButtonContent::builder().icon_name("list-add-symbolic").label("Add a PC").build())
+            .tooltip_text("Connect to another PC too; the ones connected stay connected")
+            .build();
+        let connected_label = gtk::Label::builder().hexpand(true).xalign(0.0).css_classes(["dim-label"]).build();
+        let show_all = gtk::Button::builder()
+            .child(&adw::ButtonContent::builder().icon_name("view-grid-symbolic").label("Show all").build())
+            .visible(false)
+            .build();
+        let add_strip = gtk::Box::builder().spacing(12).css_classes(["remote-bar"]).build();
+        add_strip.append(&add_button);
+        add_strip.append(&connected_label);
+        add_strip.append(&show_all);
+        let grid = gtk::Grid::builder()
+            .row_homogeneous(true)
+            .column_homogeneous(true)
+            .row_spacing(12)
+            .column_spacing(12)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        let viewers_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        viewers_page.append(&add_strip);
+        viewers_page.append(&grid);
+
         let root = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).transition_duration(150).build();
-        root.add_named(&page, Some("list"));
-        root.add_named(&viewer_slot, Some("viewer"));
+        root.add_named(&list, Some("list"));
+        root.add_named(&viewers_page, Some("viewer"));
 
         let tab = Rc::new(Self {
             root,
@@ -263,8 +310,15 @@ impl RemoteTab {
             computers,
             computer_rows: RefCell::default(),
             refresh_button,
-            viewer_slot,
-            viewer: RefCell::default(),
+            grid,
+            add_strip,
+            connected_label,
+            show_all,
+            banner,
+            viewers: RefCell::default(),
+            selected: RefCell::default(),
+            focused: RefCell::default(),
+            fullscreen: Cell::new(false),
             syncing: Cell::new(false),
             refreshing: Cell::new(false),
             busy: Cell::new(false),
@@ -364,6 +418,31 @@ impl RemoteTab {
                 if let Some(t) = weak.upgrade() {
                     t.refresh();
                     t.refresh_remote();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&tab);
+            add_button.connect_clicked(move |_| {
+                if let Some(t) = weak.upgrade() {
+                    t.show_list();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&tab);
+            tab.banner.connect_button_clicked(move |_| {
+                if let Some(t) = weak.upgrade() {
+                    t.root.set_visible_child_name("viewer");
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&tab);
+            tab.show_all.connect_clicked(move |_| {
+                if let Some(t) = weak.upgrade() {
+                    t.focused.replace(None);
+                    t.relayout();
                 }
             });
         }
@@ -543,7 +622,12 @@ impl RemoteTab {
                 None => format!("Offline · {}", h.address),
             };
             let row = adw::ActionRow::builder().title(&h.name).subtitle(subtitle).build();
-            let connect = gtk::Button::builder().label("Connect").valign(gtk::Align::Center).sensitive(rtt.is_some()).build();
+            let shown = self.is_connected(&h.fingerprint);
+            let connect = gtk::Button::builder()
+                .label(if shown { "Show" } else { "Connect" })
+                .valign(gtk::Align::Center)
+                .sensitive(rtt.is_some() || shown)
+                .build();
             connect.add_css_class("suggested-action");
             {
                 let (weak, host) = (Rc::downgrade(self), h.clone());
@@ -882,7 +966,12 @@ impl RemoteTab {
                 (_, None) => "Offline, or access from other networks is off there".to_string(),
             };
             let row = adw::ActionRow::builder().title(&h.name).subtitle(subtitle).build();
-            let connect = gtk::Button::builder().label("Connect").valign(gtk::Align::Center).sensitive(rtt.is_some()).build();
+            let shown = self.is_connected(&h.fingerprint);
+            let connect = gtk::Button::builder()
+                .label(if shown { "Show" } else { "Connect" })
+                .valign(gtk::Align::Center)
+                .sensitive(rtt.is_some() || shown)
+                .build();
             connect.add_css_class("suggested-action");
             {
                 let (weak, host) = (Rc::downgrade(self), h.clone());
@@ -979,20 +1068,91 @@ impl RemoteTab {
         self.refresh();
     }
 
+    fn is_connected(&self, fingerprint: &str) -> bool {
+        self.viewers.borrow().iter().any(|v| v.fingerprint() == fingerprint)
+    }
+
+    /// Back to the list of computers to connect another one; the connected
+    /// PCs stay connected.
+    fn show_list(self: &Rc<Self>) {
+        self.root.set_visible_child_name("list");
+        self.refresh();
+        self.refresh_remote();
+    }
+
+    /// Opens `host` in a new tile, or shows its tile if it's connected.
     fn connect(self: &Rc<Self>, host: KnownHost) {
-        if let Some(v) = self.viewer.take() {
-            v.close();
-        }
-        let name = ClientConfig::load().map(|c| c.device_name()).unwrap_or_else(|_| ac_remote::hostname());
-        let tab: Rc<dyn ViewerHost> = self.clone();
-        match Viewer::open(host, name, &self.window, self.media.clone(), self.offload, tab) {
-            Ok(v) => {
-                self.viewer_slot.append(&v.root);
-                *self.viewer.borrow_mut() = Some(v);
-                self.root.set_visible_child_name("viewer");
+        if !self.is_connected(&host.fingerprint) {
+            let name = ClientConfig::load().map(|c| c.device_name()).unwrap_or_else(|_| ac_remote::hostname());
+            let tab: Rc<dyn ViewerHost> = self.clone();
+            match Viewer::open(host.clone(), name, &self.window, self.media.clone(), self.offload, tab) {
+                Ok(v) => self.viewers.borrow_mut().push(v),
+                Err(e) => return self.toast(&format!("Couldn't connect: {e:#}")),
             }
-            Err(e) => self.toast(&format!("Couldn't connect: {e:#}")),
         }
+        // A PC shown alone keeps the screen to itself only until another is picked.
+        if self.focused.borrow().as_deref().is_some_and(|f| f != host.fingerprint) && !self.fullscreen.get() {
+            self.focused.replace(None);
+        }
+        self.select(&host.fingerprint);
+        self.relayout();
+        self.root.set_visible_child_name("viewer");
+    }
+
+    /// Gives the keyboard and mouse to the viewer of `fingerprint` alone.
+    /// The others let go first, so the grab passes from one to the next.
+    fn select(&self, fingerprint: &str) {
+        *self.selected.borrow_mut() = Some(fingerprint.to_string());
+        let viewers = self.viewers.borrow().clone();
+        for v in viewers.iter().filter(|v| v.fingerprint() != fingerprint) {
+            v.set_selected(false);
+        }
+        if let Some(v) = viewers.iter().find(|v| v.fingerprint() == fingerprint) {
+            v.set_selected(true);
+        }
+    }
+
+    /// Lays the tiles out in a grid: one fills the tab, two to four go two
+    /// by two, more three across. A focused PC is shown alone.
+    fn relayout(&self) {
+        while let Some(c) = self.grid.first_child() {
+            self.grid.remove(&c);
+        }
+        let viewers = self.viewers.borrow().clone();
+        let focused = self.focused.borrow().clone().filter(|f| viewers.iter().any(|v| v.fingerprint() == f));
+        let multi = viewers.len() > 1;
+        let shown: Vec<&Rc<Viewer>> = viewers.iter().filter(|v| focused.as_deref().is_none_or(|f| v.fingerprint() == f)).collect();
+        let cols = match shown.len() {
+            0 | 1 => 1,
+            2..=4 => 2,
+            _ => 3,
+        };
+        for (i, v) in shown.iter().enumerate() {
+            self.grid.attach(&v.root, (i % cols) as i32, (i / cols) as i32, 1, 1);
+        }
+        for v in &viewers {
+            v.arrange(multi, focused.as_deref() == Some(v.fingerprint()));
+        }
+        let fullscreen = self.fullscreen.get();
+        let margin = if fullscreen { 0 } else { 12 };
+        self.grid.set_margin_top(margin);
+        self.grid.set_margin_bottom(margin);
+        self.grid.set_margin_start(margin);
+        self.grid.set_margin_end(margin);
+        self.add_strip.set_visible(!fullscreen);
+        self.show_all.set_visible(multi && focused.is_some());
+        let names: Vec<&str> = viewers.iter().map(|v| v.host_name()).collect();
+        let summary = match names.len() {
+            0 => String::new(),
+            1 => format!("Connected to {}", names[0]),
+            n => format!("{n} PCs connected · click one to control it"),
+        };
+        self.connected_label.set_label(&summary);
+        self.banner.set_title(&match names.len() {
+            1 => format!("Connected to {}", names[0]),
+            n => format!("{n} PCs connected"),
+        });
+        self.banner.set_revealed(!names.is_empty());
     }
 
     /// Opens the paired PC with this fingerprint (`test-bed --connect`, which
@@ -1001,9 +1161,6 @@ impl RemoteTab {
         let host = KnownHosts::load().ok().and_then(|k| k.hosts.into_iter().find(|h| h.fingerprint == fingerprint));
         match host {
             Some(h) => {
-                if self.viewer.borrow().as_ref().is_some_and(|v| v.fingerprint() == fingerprint) {
-                    return;
-                }
                 self.connect(h)
             }
             None => self.toast("Couldn't switch sides: that PC isn't paired with this one"),
@@ -1038,19 +1195,51 @@ impl RemoteTab {
 }
 
 impl ViewerHost for RemoteTab {
-    fn viewer_closed(&self) {
-        self.root.set_visible_child_name("list");
-        if let Some(v) = self.viewer.take() {
-            tracing::info!("disconnected from {}", v.host_name());
+    fn viewer_closed(&self, fingerprint: &str) {
+        let closed = {
+            let mut viewers = self.viewers.borrow_mut();
+            let i = viewers.iter().position(|v| v.fingerprint() == fingerprint);
+            i.map(|i| viewers.remove(i))
+        };
+        let Some(v) = closed else { return };
+        tracing::info!("disconnected from {}", v.host_name());
+        if v.root.parent().is_some() {
+            self.grid.remove(&v.root);
         }
-        while let Some(c) = self.viewer_slot.first_child() {
-            self.viewer_slot.remove(&c);
+        if self.focused.borrow().as_deref() == Some(fingerprint) {
+            self.focused.replace(None);
+        }
+        let next = self.viewers.borrow().first().map(|v| v.fingerprint().to_string());
+        match next {
+            Some(fp) if self.selected.borrow().as_deref() == Some(fingerprint) => self.select(&fp),
+            Some(_) => {}
+            None => {
+                self.selected.replace(None);
+                self.root.set_visible_child_name("list");
+            }
+        }
+        self.relayout();
+    }
+
+    fn viewer_fullscreen(&self, fingerprint: &str, on: bool) {
+        self.toolbar.set_reveal_top_bars(!on);
+        self.toolbar.set_reveal_bottom_bars(!on);
+        self.fullscreen.set(on);
+        // Fullscreen shows that PC alone; leaving it shows them all again.
+        self.focused.replace(on.then(|| fingerprint.to_string()));
+        self.relayout();
+    }
+
+    fn viewer_select(&self, fingerprint: &str) {
+        if self.selected.borrow().as_deref() != Some(fingerprint) {
+            self.select(fingerprint);
         }
     }
 
-    fn viewer_fullscreen(&self, on: bool) {
-        self.toolbar.set_reveal_top_bars(!on);
-        self.toolbar.set_reveal_bottom_bars(!on);
+    fn viewer_focus(&self, fingerprint: &str, on: bool) {
+        self.focused.replace(on.then(|| fingerprint.to_string()));
+        self.select(fingerprint);
+        self.relayout();
     }
 
     fn viewer_grabbing(&self, on: bool) {

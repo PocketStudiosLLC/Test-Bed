@@ -39,16 +39,25 @@ const ERROR_WINDOW: Duration = Duration::from_secs(2);
 const ERROR_BURST: usize = 8;
 const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// Touchpad scrolling: pixels per wheel notch.
+/// evdev codes for the Task Manager chord.
+const KEY_ESC: u16 = 1;
+const KEY_LEFTCTRL: u16 = 29;
+const KEY_LEFTSHIFT: u16 = 42;
 const PIXELS_PER_NOTCH: f64 = 20.0;
 /// A PC that hasn't answered a switch by then can't switch (RemoteLinux).
 const SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 const CHORD: gdk::ModifierType =
     gdk::ModifierType::CONTROL_MASK.union(gdk::ModifierType::ALT_MASK).union(gdk::ModifierType::SHIFT_MASK);
 
-/// What the viewer asks of the PC tab.
+/// What the viewer asks of the PC tab. `fingerprint` names the viewer: the
+/// tab can show several PCs at once, one of which has the keyboard and mouse.
 pub trait ViewerHost {
-    fn viewer_closed(&self);
-    fn viewer_fullscreen(&self, on: bool);
+    fn viewer_closed(&self, fingerprint: &str);
+    fn viewer_fullscreen(&self, fingerprint: &str, on: bool);
+    /// This viewer was clicked: it takes the keyboard and mouse.
+    fn viewer_select(&self, fingerprint: &str);
+    /// Show only this PC (`on`), or all of them again.
+    fn viewer_focus(&self, fingerprint: &str, on: bool);
     /// Keyboard and mouse go to the remote PC: Test Bed's own shortcuts
     /// must let keys through.
     fn viewer_grabbing(&self, on: bool);
@@ -105,9 +114,18 @@ pub struct Viewer {
     monitors_box: gtk::Box,
     stats: gtk::Label,
     fullscreen_button: gtk::Button,
+    /// Windows PCs only: Ctrl+Shift+Esc there.
+    task_manager_button: gtk::Button,
     switch_button: gtk::Button,
+    switch_content: adw::ButtonContent,
     send_button: gtk::Button,
+    send_content: adw::ButtonContent,
+    focus_button: gtk::ToggleButton,
     transfer: gtk::Label,
+    /// The one viewer of several that gets the keyboard and mouse.
+    selected: Cell<bool>,
+    /// Other PCs are connected too.
+    multi: Cell<bool>,
     state: RefCell<State>,
     keys: RefCell<Option<gtk::EventControllerKey>>,
     window_active: RefCell<Option<glib::SignalHandlerId>>,
@@ -165,7 +183,7 @@ impl Viewer {
         let overlay_status = gtk::Label::builder().css_classes(["title-2"]).wrap(true).justify(gtk::Justification::Center).build();
         let overlay_detail = gtk::Label::builder().wrap(true).justify(gtk::Justification::Center).max_width_chars(60).build();
         overlay_detail.add_css_class("dim-label");
-        let back = gtk::Button::builder().label("Back to computers").halign(gtk::Align::Center).visible(false).build();
+        let back = gtk::Button::builder().label("Close").halign(gtk::Align::Center).visible(false).build();
         back.add_css_class("pill");
         let overlay_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -190,19 +208,22 @@ impl Viewer {
         overlay.add_overlay(&overlay_box);
         overlay.add_overlay(&hint);
 
-        let disconnect = gtk::Button::builder().icon_name("go-previous-symbolic").tooltip_text("Disconnect (Ctrl+Alt+Shift+D)").build();
-        let title = gtk::Label::builder().label(&host.name).css_classes(["heading"]).build();
+        let disconnect = gtk::Button::builder().icon_name("window-close-symbolic").tooltip_text("Disconnect (Ctrl+Alt+Shift+D)").build();
+        disconnect.add_css_class("flat");
+        let title = gtk::Label::builder().label(&host.name).css_classes(["heading"]).ellipsize(gtk::pango::EllipsizeMode::End).build();
         let monitors_box = gtk::Box::builder().spacing(4).margin_start(12).build();
         let stats = gtk::Label::builder().hexpand(true).halign(gtk::Align::End).css_classes(["dim-label", "numeric"]).build();
+        let switch_content = adw::ButtonContent::builder().icon_name("object-flip-horizontal-symbolic").label("Switch sides").build();
         let switch_button = gtk::Button::builder()
-            .label("Switch sides")
+            .child(&switch_content)
             .tooltip_text(format!("Let {} control this PC instead (Ctrl+Alt+Shift+S)", host.name))
             .sensitive(false)
             // Switching sides works on the local network only (spec3 §6).
             .visible(!host.internet)
             .build();
+        let send_content = adw::ButtonContent::builder().icon_name("document-send-symbolic").label("Send file").build();
         let send_button = gtk::Button::builder()
-            .child(&adw::ButtonContent::builder().icon_name("document-send-symbolic").label("Send file").build())
+            .child(&send_content)
             .tooltip_text(format!("Send files to the Downloads folder on {}. You can also drop files on its screen.", host.name))
             .sensitive(false)
             .build();
@@ -218,18 +239,28 @@ impl Viewer {
             b.set_icon_name(if on { "audio-volume-muted-symbolic" } else { "audio-volume-high-symbolic" });
             b.set_tooltip_text(Some(if on { "Sound muted: click to hear this PC" } else { "Mute this PC's sound" }));
         });
+        // Shown once the PC says it runs Windows.
+        let task_manager_button = gtk::Button::builder()
+            .icon_name("utilities-system-monitor-symbolic")
+            .tooltip_text("Open Task Manager on this PC (Ctrl+Shift+Esc)")
+            .sensitive(false)
+            .visible(false)
+            .build();
         let fullscreen_button = gtk::Button::builder().icon_name("view-fullscreen-symbolic").tooltip_text("Fullscreen (Ctrl+Alt+Shift+F)").build();
+        let focus_button = gtk::ToggleButton::builder().icon_name("zoom-fit-best-symbolic").tooltip_text("Show only this PC").visible(false).build();
         let bar = gtk::Box::builder().spacing(6).css_classes(["remote-bar"]).build();
-        bar.append(&disconnect);
         bar.append(&title);
         bar.append(&monitors_box);
         bar.append(&stats);
         bar.append(&transfer);
         bar.append(&send_button);
         bar.append(&switch_button);
+        bar.append(&task_manager_button);
         bar.append(&mute_button);
         bar.append(&fullscreen_button);
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        bar.append(&focus_button);
+        bar.append(&disconnect);
+        let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).hexpand(true).vexpand(true).css_classes(["card", "pc-tile"]).build();
         root.append(&bar);
         root.append(&overlay);
 
@@ -248,9 +279,15 @@ impl Viewer {
             monitors_box,
             stats,
             fullscreen_button,
+            task_manager_button,
             switch_button,
+            switch_content,
             send_button,
+            send_content,
+            focus_button,
             transfer,
+            selected: Cell::new(true),
+            multi: Cell::new(false),
             state: RefCell::new(State { forwarding: true, ..Default::default() }),
             keys: RefCell::default(),
             window_active: RefCell::default(),
@@ -288,7 +325,26 @@ impl Viewer {
             let weak = Rc::downgrade(&v);
             v.fullscreen_button.connect_clicked(move |_| {
                 if let Some(v) = weak.upgrade() {
+                    v.tab.viewer_select(&v.host.fingerprint);
                     v.toggle_fullscreen();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&v);
+            v.task_manager_button.connect_clicked(move |_| {
+                if let Some(v) = weak.upgrade() {
+                    v.tab.viewer_select(&v.host.fingerprint);
+                    v.open_task_manager();
+                }
+            });
+        }
+        {
+            // Clicked, not toggled: the tab sets the button to match its layout.
+            let weak = Rc::downgrade(&v);
+            v.focus_button.connect_clicked(move |b| {
+                if let Some(v) = weak.upgrade() {
+                    v.tab.viewer_focus(&v.host.fingerprint, b.is_active());
                 }
             });
         }
@@ -334,7 +390,47 @@ impl Viewer {
     /// Keyboard and mouse go to the PC.
     fn active(&self) -> bool {
         let s = self.state.borrow();
-        s.connected && s.forwarding && self.window.is_active() && !self.closed.get()
+        s.connected && s.forwarding && self.selected.get() && self.window.is_active() && !self.closed.get()
+    }
+
+    /// Gives this viewer the keyboard and mouse, or takes them away.
+    pub fn set_selected(&self, on: bool) {
+        if !on && self.active() {
+            self.release_all();
+            self.state.borrow_mut().swallowed.clear();
+        }
+        self.selected.set(on);
+        self.update_grab();
+        self.mark_selected();
+    }
+
+    fn mark_selected(&self) {
+        if self.multi.get() && self.selected.get() && !self.state.borrow().fullscreen {
+            self.root.add_css_class("selected");
+        } else {
+            self.root.remove_css_class("selected");
+        }
+    }
+
+    /// How the tab shows this viewer: `multi` when other PCs are connected
+    /// too, `focused` when it's the only one shown of several.
+    pub fn arrange(&self, multi: bool, focused: bool) {
+        self.multi.set(multi);
+        let fullscreen = self.state.borrow().fullscreen;
+        let compact = multi && !focused && !fullscreen;
+        self.focus_button.set_visible(multi && !fullscreen);
+        self.focus_button.set_active(focused);
+        self.focus_button.set_tooltip_text(Some(if focused { "Show all PCs" } else { "Show only this PC" }));
+        // Small tiles: buttons without words, no figures.
+        self.stats.set_visible(!compact);
+        self.send_content.set_label(if compact { "" } else { "Send file" });
+        self.switch_content.set_label(if compact { "" } else { "Switch sides" });
+        if fullscreen {
+            self.root.remove_css_class("card");
+        } else {
+            self.root.add_css_class("card");
+        }
+        self.mark_selected();
     }
 
     /// Grabs or lets go of the keyboard to match [`Self::active`]: Hyprland's
@@ -353,7 +449,7 @@ impl Viewer {
             self.tab.viewer_grabbing(on);
         }
         let s = self.state.borrow();
-        self.hint.set_visible(s.connected && !s.forwarding);
+        self.hint.set_visible(s.connected && (!s.forwarding || !self.selected.get()));
     }
 
     fn release_all(&self) {
@@ -391,7 +487,7 @@ impl Viewer {
                     self.show_status(&format!("Connecting to {}…", self.host.name), "");
                 }
             }
-            NetEvent::Connected { mut monitors, .. } => {
+            NetEvent::Connected { mut monitors, host_os, .. } => {
                 monitors.sort_by_key(|m| (m.y, m.x));
                 {
                     let mut s = self.state.borrow_mut();
@@ -401,6 +497,8 @@ impl Viewer {
                 self.show_status("", "");
                 self.switch_button.set_sensitive(true);
                 self.send_button.set_sensitive(true);
+                self.task_manager_button.set_visible(host_os.as_deref() == Some("windows"));
+                self.task_manager_button.set_sensitive(true);
                 self.rebuild_monitors();
                 self.update_grab();
             }
@@ -475,6 +573,7 @@ impl Viewer {
         if !self.state.borrow().connected {
             self.switch_button.set_sensitive(false);
             self.send_button.set_sensitive(false);
+            self.task_manager_button.set_sensitive(false);
         }
     }
 
@@ -666,7 +765,7 @@ impl Viewer {
             self.window.unfullscreen();
         }
         self.fullscreen_button.set_icon_name(if on { "view-restore-symbolic" } else { "view-fullscreen-symbolic" });
-        self.tab.viewer_fullscreen(on);
+        self.tab.viewer_fullscreen(&self.host.fingerprint, on);
     }
 
     fn present_frame(&self) {
@@ -768,6 +867,12 @@ impl Viewer {
             gdk::EventType::ButtonPress => {
                 let Some(button) = ev.downcast_ref::<gdk::ButtonEvent>().map(|b| b.button()) else { return glib::Propagation::Proceed };
                 self.picture.grab_focus();
+                if !self.selected.get() {
+                    // The click picks this PC; it stays here.
+                    self.state.borrow_mut().swallowed_buttons.insert(button);
+                    self.tab.viewer_select(&self.host.fingerprint);
+                    return glib::Propagation::Stop;
+                }
                 let (connected, forwarding) = {
                     let s = self.state.borrow();
                     (s.connected, s.forwarding)
@@ -855,7 +960,7 @@ impl Viewer {
             let weak = Rc::downgrade(self);
             keys.connect_key_pressed(move |_, keyval, keycode, state| {
                 let Some(v) = weak.upgrade() else { return glib::Propagation::Proceed };
-                if !v.root.is_mapped() {
+                if !v.root.is_mapped() || !v.selected.get() {
                     return glib::Propagation::Proceed;
                 }
                 if state.contains(CHORD) && v.chord(keyval) {
@@ -931,7 +1036,24 @@ impl Viewer {
         true
     }
 
-    /// Disconnects and hands the tab back to the list of computers.
+    /// Ctrl+Shift+Esc on the PC, which opens Windows' Task Manager.
+    fn open_task_manager(&self) {
+        if !self.state.borrow().connected {
+            return;
+        }
+        // Keys still held here would turn the chord into something else.
+        self.release_all();
+        const CHORD: [u16; 3] = [KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_ESC];
+        for code in CHORD {
+            self.send(ClientMsg::Key { code, pressed: true });
+        }
+        for code in CHORD.into_iter().rev() {
+            self.send(ClientMsg::Key { code, pressed: false });
+        }
+        self.picture.grab_focus();
+    }
+
+    /// Disconnects and takes this PC off the tab.
     pub fn close(&self) {
         if self.closed.replace(true) {
             return;
@@ -951,7 +1073,7 @@ impl Viewer {
         if let Some(id) = self.window_active.take() {
             self.window.disconnect(id);
         }
-        self.tab.viewer_closed();
+        self.tab.viewer_closed(&self.host.fingerprint);
     }
 }
 
