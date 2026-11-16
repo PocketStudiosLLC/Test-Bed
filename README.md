@@ -40,6 +40,13 @@ Both PCs run Test Bed on the same local network.
    **Finish setup** shows, click **Allow** once; it lets the shared PC create a
    virtual keyboard and mouse, and opens ufw to your home network (UDP 47800).
    Then click **Show pairing code**.
+
+   On Windows, Windows blocks clicks and typing in windows running as
+   administrator (Task Manager, admin terminals, some installers) unless
+   sharing runs as administrator too: turn on **Control administrator
+   windows** and accept Windows' prompt. Sharing then starts from a scheduled
+   task with your highest rights. Windows' own UAC prompts stay out of reach;
+   they appear on a separate, secure desktop.
 2. **On the other PC:** the shared PC appears under **Computers**. Click **Pair**
    and type the code. (Or use **Pair by address**.)
 3. Click **Connect**. The remote screen fills the PC tab. Buttons 1–4 switch

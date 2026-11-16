@@ -59,9 +59,8 @@ impl Listener {
         }
         #[cfg(windows)]
         {
-            use tokio::net::windows::named_pipe::ServerOptions;
             // The first instance claims the name: a second service fails here.
-            let next = ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&path)?;
+            let next = pipe::create(&path, true)?;
             Ok(Self { next })
         }
     }
@@ -74,11 +73,80 @@ impl Listener {
         }
         #[cfg(windows)]
         {
-            use tokio::net::windows::named_pipe::ServerOptions;
             self.next.connect().await?;
-            let fresh = ServerOptions::new().reject_remote_clients(true).create(crate::paths::host_control_socket())?;
+            let fresh = pipe::create(&crate::paths::host_control_socket(), false)?;
             Ok(split(std::mem::replace(&mut self.next, fresh)))
         }
+    }
+}
+
+/// The pipe's security. The service may run as administrator (to control
+/// administrator windows), and then the pipe's default security would let in
+/// administrator processes only: Test Bed, which isn't one, couldn't reach
+/// it. So it names this user (and SYSTEM and administrators) outright.
+#[cfg(windows)]
+mod pipe {
+    use std::ffi::c_void;
+    use std::io;
+    use std::path::Path;
+
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// This process's user, as an SID string (`S-1-5-21-…`).
+    fn user_sid() -> windows::core::Result<String> {
+        unsafe {
+            let mut token = HANDLE::default();
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+            let mut len = 0u32;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+            let mut buf = vec![0u8; len as usize];
+            let r = GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len);
+            let _ = CloseHandle(token);
+            r?;
+            let user = &*(buf.as_ptr() as *const TOKEN_USER);
+            let mut s = PWSTR::null();
+            ConvertSidToStringSidW(user.User.Sid, &mut s)?;
+            let sid = s.to_string().unwrap_or_default();
+            let _ = LocalFree(Some(HLOCAL(s.0.cast())));
+            Ok(sid)
+        }
+    }
+
+    pub fn create(path: &Path, first: bool) -> io::Result<NamedPipeServer> {
+        let mut opts = ServerOptions::new();
+        opts.first_pipe_instance(first).reject_remote_clients(true);
+        let sid = match user_sid() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("control pipe: can't read this user's SID ({e}); using default security");
+                return opts.create(path);
+            }
+        };
+        // Full access for this user, SYSTEM and administrators; medium
+        // integrity (an ordinary app) may write to it.
+        let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NW;;;ME)").encode_utf16().chain([0]).collect();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        if let Err(e) = unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), SDDL_REVISION_1, &mut sd, None) } {
+            tracing::warn!("control pipe: bad security descriptor ({e}); using default security");
+            return opts.create(path);
+        }
+        let mut attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: false.into(),
+        };
+        let r = unsafe { opts.create_with_security_attributes_raw(path, (&mut attrs as *mut SECURITY_ATTRIBUTES).cast::<c_void>()) };
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+        r
     }
 }
 

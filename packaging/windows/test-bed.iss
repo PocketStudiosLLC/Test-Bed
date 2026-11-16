@@ -1,6 +1,8 @@
 ; Test Bed for Windows: installs the bundle the Windows workflow builds.
 ; Per user, no administrator rights: the share service runs as the signed-in
-; user anyway (an HKCU Run entry starts it at sign-in).
+; user anyway. An HKCU Run entry starts it at sign-in or, with "Control
+; administrator windows" on in Test Bed, a scheduled task with the user's
+; highest rights; the installer can't kill that one, so it asks it to stop.
 ;
 ;   ISCC /DAppVersion=2.1.0 /DSourceDir=dist\TestBed /DOutputDir=. test-bed.iss
 
@@ -55,31 +57,72 @@ Name: "{autodesktop}\Test Bed"; Filename: "{app}\bin\test-bed.exe"; WorkingDir: 
 [Run]
 ; Sharing was on before the upgrade: start it again from the new files.
 Filename: "{app}\bin\test-bed-share.exe"; Parameters: "run"; Flags: nowait runhidden; Check: ShareWasOn
+; It ran as administrator: start the task again (no prompt needed).
+Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""Test Bed Share"""; Flags: runhidden; Check: AdminShareWasOn
 Filename: "{app}\bin\test-bed.exe"; Description: "Open Test Bed"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
+; Asked first: as administrator it can't be killed from here.
+Filename: "{app}\bin\test-bed-share.exe"; Parameters: "stop"; Flags: runhidden; RunOnceId: "AskShareToStop"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM test-bed-share.exe"; Flags: runhidden; RunOnceId: "StopShare"
 Filename: "{sys}\reg.exe"; Parameters: "delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v ""Test Bed Share"" /f"; Flags: runhidden; RunOnceId: "RemoveSignIn"
 
 [Code]
 const
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  TaskName = 'Test Bed Share';
 var
   WasSharing: Boolean;
+  WasAdminSharing: Boolean;
 
 function ShareWasOn: Boolean;
 begin
   Result := WasSharing;
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function AdminShareWasOn: Boolean;
+begin
+  Result := WasAdminSharing;
+end;
+
+// The scheduled task "Control administrator windows" sets up.
+function TaskExists: Boolean;
 var
   Code: Integer;
 begin
-  WasSharing := RegValueExists(HKEY_CURRENT_USER, RunKey, 'Test Bed Share');
-  // Stop sharing so its files can be replaced.
+  Result := Exec(ExpandConstant('{sys}\schtasks.exe'), '/Query /TN "' + TaskName + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
+end;
+
+// Stops sharing however it runs: asked over its pipe (the only way when it
+// runs as administrator), ended as a task, then killed (older versions).
+procedure StopSharing;
+var
+  Code: Integer;
+begin
+  if FileExists(ExpandConstant('{app}\bin\test-bed-share.exe')) then
+    Exec(ExpandConstant('{app}\bin\test-bed-share.exe'), 'stop', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  if WasAdminSharing then
+    Exec(ExpandConstant('{sys}\schtasks.exe'), '/End /TN "' + TaskName + '"', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM test-bed-share.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Sleep(1000);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  WasSharing := RegValueExists(HKEY_CURRENT_USER, RunKey, 'Test Bed Share');
+  WasAdminSharing := TaskExists;
+  // Stop sharing so its files can be replaced.
+  StopSharing;
   Result := '';
+end;
+
+// The task can only be removed as administrator: Windows asks.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Code: Integer;
+begin
+  if (CurUninstallStep = usUninstall) and TaskExists then
+    ShellExec('runas', ExpandConstant('{sys}\schtasks.exe'), '/Delete /TN "' + TaskName + '" /F', '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

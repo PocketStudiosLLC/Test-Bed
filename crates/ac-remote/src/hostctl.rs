@@ -1,6 +1,6 @@
 //! Managing the local host daemon from a frontend: talking to its control
-//! socket, starting it at login (a systemd user service on Linux, a Run
-//! entry on Windows), and Linux's one-time system setup (firewall, uinput
+//! socket, starting it at login (a systemd user service on Linux; on Windows
+//! a Run entry, or a scheduled task to run as administrator), and Linux's one-time system setup (firewall, uinput
 //! access) through pkexec.
 
 use std::path::PathBuf;
@@ -257,6 +257,15 @@ pub fn service_binary() -> Option<PathBuf> {
     exec_binary(&std::fs::read_to_string(crate::paths::systemd_user_dir().join(SERVICE)).ok()?)
 }
 
+/// Running as administrator is a Windows thing: uinput reaches every window.
+pub fn admin_enabled() -> bool {
+    false
+}
+
+pub fn set_admin(_bin: &Path, _on: bool) -> Result<()> {
+    bail!("only on Windows")
+}
+
 /// Stop the service and keep it from starting at login.
 pub fn disable_service() -> Result<()> {
     let o = systemctl(&["disable", "--now", SERVICE])?;
@@ -368,5 +377,22 @@ mod tests {
         assert!(unit.contains("ExecStart=\"/home/me/Projects/Android Controller/target/debug/test-bed-share\" run"), "{unit}");
         assert_eq!(exec_binary(&unit).as_deref(), Some(bin));
         assert_eq!(exec_binary("ExecStart=/usr/bin/rl-host run").as_deref(), Some(Path::new("/usr/bin/rl-host")));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::platform::*;
+    use std::path::Path;
+
+    #[test]
+    fn the_task_runs_the_share_service_as_administrator() {
+        let bin = Path::new(r"C:\Users\Me & You\AppData\Local\Programs\Test Bed\bin\test-bed-share.exe");
+        let xml = task_xml(r"PC\Me", bin);
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"), "{xml}");
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"), "{xml}");
+        assert!(xml.contains(r#"<Command>"C:\Users\Me &amp; You\AppData\Local\Programs\Test Bed\bin\test-bed-share.exe"</Command>"#), "{xml}");
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"), "{xml}");
+        assert!(xml.contains(r"<UserId>PC\Me</UserId>"), "{xml}");
     }
 }

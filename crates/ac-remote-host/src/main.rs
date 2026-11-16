@@ -39,6 +39,8 @@ enum Cmd {
     Status,
     /// Disconnect the current client.
     Disconnect,
+    /// Stop the running daemon.
+    Stop,
     /// List monitors that can be streamed.
     Monitors,
 }
@@ -173,6 +175,11 @@ async fn main() -> Result<()> {
         Cmd::Disconnect => {
             let v = request(json!({"cmd": "disconnect"})).await.unwrap_or(json!({"running": false}));
             print(cli.json, &v, |v| println!("{}", if v["disconnected"] == json!(true) { "Disconnected." } else { "No client connected." }));
+            Ok(())
+        }
+        Cmd::Stop => {
+            let v = request(json!({"cmd": "quit"})).await.unwrap_or(json!({"running": false}));
+            print(cli.json, &v, |v| println!("{}", if v["quitting"] == json!(true) { "Stopping." } else { "Daemon not running." }));
             Ok(())
         }
         Cmd::Monitors => {

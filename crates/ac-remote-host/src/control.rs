@@ -111,6 +111,19 @@ async fn handle(host: Arc<Host>, (r, mut w): (Reader, Writer)) -> Result<()> {
                 send(&mut w, &json!({ "removed": removed, "name": name })).await?;
             }
             "disconnect" => send(&mut w, &json!({ "disconnected": host.disconnect_client() })).await?,
+            // Stop sharing. On Windows the service may run as administrator,
+            // and then Test Bed and the installer can't end it any other way.
+            "quit" => {
+                tracing::info!("asked to stop");
+                send(&mut w, &json!({ "quitting": true })).await?;
+                host.shutdown();
+                // Shutting down lets `serve` return; this is in case it doesn't.
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    ac_remote::ipc::cleanup();
+                    std::process::exit(0);
+                });
+            }
             "cancel_pair" => {
                 host.close_pairing();
                 host.close_invite();

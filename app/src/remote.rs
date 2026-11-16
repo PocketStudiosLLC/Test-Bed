@@ -99,6 +99,8 @@ pub fn share_now(done: impl FnOnce(anyhow::Result<HostStatus>) + 'static) {
 struct Snapshot {
     status: Option<HostStatus>,
     service_enabled: bool,
+    /// Windows: sharing runs as administrator.
+    admin_enabled: bool,
     needs_uinput: bool,
     needs_firewall: bool,
     found: Vec<Discovered>,
@@ -137,13 +139,18 @@ async fn snapshot() -> Snapshot {
         .zip(probes)
         .filter_map(|(h, p)| p.online.then(|| (h.fingerprint.clone(), p.rtt_ms.unwrap_or(0.0))))
         .collect();
-    let (service_enabled, needs_uinput, needs_firewall) = tokio::task::spawn_blocking(|| {
-        (hostctl::service_enabled(), !hostctl::uinput_writable() || !hostctl::input_readable(), hostctl::ufw_active() && !hostctl::firewall_opened())
+    let (service_enabled, admin_enabled, needs_uinput, needs_firewall) = tokio::task::spawn_blocking(|| {
+        (
+            hostctl::service_enabled(),
+            hostctl::admin_enabled(),
+            !hostctl::uinput_writable() || !hostctl::input_readable(),
+            hostctl::ufw_active() && !hostctl::firewall_opened(),
+        )
     })
     .await
-    .unwrap_or((false, false, false));
+    .unwrap_or((false, false, false, false));
     let internet_enabled = ac_remote::config::HostConfig::load().map(|c| c.internet).unwrap_or(false);
-    Snapshot { status, service_enabled, needs_uinput, needs_firewall, found, known: kh.hosts, online, internet_enabled }
+    Snapshot { status, service_enabled, admin_enabled, needs_uinput, needs_firewall, found, known: kh.hosts, online, internet_enabled }
 }
 
 pub struct RemoteTab {
@@ -154,6 +161,8 @@ pub struct RemoteTab {
     media: Option<Arc<MediaContext>>,
     offload: bool,
     share: adw::SwitchRow,
+    /// Windows only: run sharing as administrator.
+    admin: adw::SwitchRow,
     setup: adw::ActionRow,
     pair: adw::ActionRow,
     internet: adw::SwitchRow,
@@ -204,6 +213,12 @@ impl RemoteTab {
             .description("Paired computers on your network can see and control this PC. Sharing starts at login, even when Test Bed is closed.")
             .build();
         let share = adw::SwitchRow::builder().title("Share this PC").subtitle("Off").build();
+        let admin = adw::SwitchRow::builder()
+            .title("Control administrator windows")
+            .subtitle("Off · Windows blocks clicks and typing in windows running as administrator")
+            .visible(cfg!(windows))
+            .sensitive(false)
+            .build();
         let setup_button = gtk::Button::builder().label("Allow").valign(gtk::Align::Center).build();
         setup_button.add_css_class("suggested-action");
         let setup = adw::ActionRow::builder().title("Finish setup").visible(false).build();
@@ -224,6 +239,7 @@ impl RemoteTab {
             .build();
         invite.add_suffix(&invite_button);
         share_group.add(&share);
+        share_group.add(&admin);
         share_group.add(&setup);
         share_group.add(&pair);
         share_group.add(&internet);
@@ -298,6 +314,7 @@ impl RemoteTab {
             media,
             offload,
             share,
+            admin,
             setup,
             pair,
             internet,
@@ -358,6 +375,16 @@ impl RemoteTab {
             invite_button.connect_clicked(move |_| {
                 if let Some(t) = weak.upgrade() {
                     t.show_pairing_code(true);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&tab);
+            tab.admin.connect_active_notify(move |row| {
+                if let Some(t) = weak.upgrade()
+                    && !t.syncing.get()
+                {
+                    t.set_admin(row.is_active());
                 }
             });
         }
@@ -511,8 +538,15 @@ impl RemoteTab {
         if !self.busy.get() {
             self.syncing.set(true);
             self.share.set_active(s.service_enabled || running);
+            self.admin.set_active(s.admin_enabled);
             self.internet.set_active(s.internet_enabled);
             self.syncing.set(false);
+            self.admin.set_sensitive(s.service_enabled);
+            self.admin.set_subtitle(if s.admin_enabled {
+                "On · sharing runs as administrator. Windows' own UAC prompts still can't be reached."
+            } else {
+                "Off · Windows blocks clicks and typing in windows running as administrator"
+            });
         }
         let net = s.status.as_ref().map(|st| &st.internet);
         let internet_subtitle = match net {
@@ -897,6 +931,35 @@ impl RemoteTab {
             });
         });
         alert.present(Some(&self.window));
+    }
+
+    /// Runs sharing as administrator, or not. Windows asks through UAC.
+    fn set_admin(self: &Rc<Self>, on: bool) {
+        self.busy.set(true);
+        self.admin.set_sensitive(false);
+        self.admin.set_subtitle("Waiting for Windows' administrator prompt…");
+        let weak = Rc::downgrade(self);
+        blocking(
+            move || {
+                let bin = hostctl::host_binary().ok_or_else(|| anyhow::anyhow!("test-bed-share is not installed next to Test Bed"))?;
+                hostctl::set_admin(&bin, on)
+            },
+            move |r| {
+                let Some(t) = weak.upgrade() else { return };
+                t.busy.set(false);
+                match r {
+                    Ok(()) if on => t.toast("Sharing now runs as administrator: paired computers can use administrator windows"),
+                    Ok(()) => t.toast("Sharing no longer runs as administrator"),
+                    Err(e) => t.toast(&format!("Couldn't change that: {e:#}")),
+                }
+                let w2 = Rc::downgrade(&t);
+                glib::timeout_add_local_once(Duration::from_millis(1000), move || {
+                    if let Some(t) = w2.upgrade() {
+                        t.refresh();
+                    }
+                });
+            },
+        );
     }
 
     fn set_internet(self: &Rc<Self>, on: bool) {
