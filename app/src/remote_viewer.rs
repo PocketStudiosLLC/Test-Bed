@@ -4,8 +4,8 @@
 //! like a phone's (VA-API when available) and drawn with graphics offload.
 //!
 //! Chords (Ctrl+Alt+Shift with): Q releases or takes back keyboard and mouse,
-//! F fullscreen, D disconnect, S switch sides, 1–9 switch monitor. They never
-//! reach the PC.
+//! F fullscreen, D disconnect, S switch sides, R reconnect, 1–9 switch
+//! monitor. They never reach the PC.
 //!
 //! Switch sides hands control the other way: this PC is shared (sharing is
 //! turned on if it was off), the two PCs trust each other's sharing over this
@@ -116,6 +116,8 @@ pub struct Viewer {
     fullscreen_button: gtk::Button,
     /// Windows PCs only: Ctrl+Shift+Esc there.
     task_manager_button: gtk::Button,
+    /// Drops the connection and dials again: for input that stopped working.
+    reconnect_button: gtk::Button,
     switch_button: gtk::Button,
     switch_content: adw::ButtonContent,
     send_button: gtk::Button,
@@ -246,6 +248,10 @@ impl Viewer {
             .sensitive(false)
             .visible(false)
             .build();
+        let reconnect_button = gtk::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .tooltip_text("Reconnect, if the keyboard or mouse stopped working (Ctrl+Alt+Shift+R)")
+            .build();
         let fullscreen_button = gtk::Button::builder().icon_name("view-fullscreen-symbolic").tooltip_text("Fullscreen (Ctrl+Alt+Shift+F)").build();
         let focus_button = gtk::ToggleButton::builder().icon_name("zoom-fit-best-symbolic").tooltip_text("Show only this PC").visible(false).build();
         let bar = gtk::Box::builder().spacing(6).css_classes(["remote-bar"]).build();
@@ -257,6 +263,7 @@ impl Viewer {
         bar.append(&switch_button);
         bar.append(&task_manager_button);
         bar.append(&mute_button);
+        bar.append(&reconnect_button);
         bar.append(&fullscreen_button);
         bar.append(&focus_button);
         bar.append(&disconnect);
@@ -280,6 +287,7 @@ impl Viewer {
             stats,
             fullscreen_button,
             task_manager_button,
+            reconnect_button,
             switch_button,
             switch_content,
             send_button,
@@ -336,6 +344,15 @@ impl Viewer {
                 if let Some(v) = weak.upgrade() {
                     v.tab.viewer_select(&v.host.fingerprint);
                     v.open_task_manager();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&v);
+            v.reconnect_button.connect_clicked(move |_| {
+                if let Some(v) = weak.upgrade() {
+                    v.tab.viewer_select(&v.host.fingerprint);
+                    v.reconnect();
                 }
             });
         }
@@ -543,6 +560,8 @@ impl Viewer {
                 }
                 self.update_grab();
                 tracing::warn!("remote {}: {msg}", self.host.name);
+                // The connection gave up for good: nothing to reconnect.
+                self.reconnect_button.set_sensitive(false);
                 self.show_status("Can't connect", &msg);
             }
             NetEvent::SwitchReady { client_name, client_fingerprint } => self.switch_ready(client_name, client_fingerprint),
@@ -1016,6 +1035,10 @@ impl Viewer {
             }
             'f' => self.toggle_fullscreen(),
             's' => self.switch_sides(),
+            'r' => {
+                self.reconnect();
+                return true;
+            }
             'd' => {
                 self.close();
                 return true;
@@ -1050,6 +1073,31 @@ impl Viewer {
         for code in CHORD.into_iter().rev() {
             self.send(ClientMsg::Key { code, pressed: false });
         }
+        self.picture.grab_focus();
+    }
+
+    /// Drops the connection and dials again at once, also cutting short a
+    /// wait between retries. The PC lets go of every key and button and
+    /// starts input afresh: the fix for a keyboard or mouse that stopped.
+    fn reconnect(&self) {
+        if self.state.borrow().fatal || self.closed.get() {
+            return;
+        }
+        if self.state.borrow().connected {
+            self.release_all();
+        }
+        {
+            let mut s = self.state.borrow_mut();
+            s.connected = false;
+            s.swallowed.clear();
+            s.swallowed_buttons.clear();
+        }
+        self.update_grab();
+        self.switch_button.set_sensitive(false);
+        self.send_button.set_sensitive(false);
+        self.task_manager_button.set_sensitive(false);
+        self.show_status(&format!("Reconnecting to {}…", self.host.name), "");
+        let _ = self.net.tx.send(Outgoing::Reconnect(Instant::now()));
         self.picture.grab_focus();
     }
 

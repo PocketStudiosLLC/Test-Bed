@@ -52,9 +52,13 @@ Both PCs run Test Bed on the same local network.
 
 While the remote PC has the keyboard, every key goes to it, Super shortcuts
 included. Ctrl+Alt+Shift with **Q** releases (click the picture to take it back),
-**F** toggles fullscreen, **D** disconnects, **S** switches sides, and **1–9**
-switch monitors. The remote PC's sound is muted at first; the speaker button
-next to **Switch sides** plays it on this PC.
+**F** toggles fullscreen, **D** disconnects, **S** switches sides, **R**
+reconnects, and **1–9** switch monitors. The remote PC's sound is muted at
+first; the speaker button next to **Switch sides** plays it on this PC.
+
+If the keyboard or mouse stops reaching the PC, the reconnect button (↻) drops
+the connection and dials again at once: the PC lets go of every key and button
+and starts input afresh. It also cuts short a wait between retries.
 
 **Switch sides** flips control: the PC you're viewing then controls this one.
 Test Bed shares this PC if it wasn't already, the two PCs trust each other over

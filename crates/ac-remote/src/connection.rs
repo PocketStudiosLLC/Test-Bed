@@ -68,6 +68,10 @@ pub enum Outgoing {
     /// Hear about the host's clipboard ([`NetEvent::Clipboard`]), from now on
     /// and after reconnecting.
     WatchClipboard,
+    /// Drop the session and dial again now (skipping any backoff wait): the
+    /// host starts input afresh. A request older than the current session is
+    /// ignored, so one sent while dialing doesn't end the session it waited for.
+    Reconnect(Instant),
     Quit,
 }
 
@@ -90,6 +94,8 @@ struct Clip {
 
 enum Ended {
     Quit,
+    /// The viewer asked: dial again at once.
+    Reconnect,
     Fatal(String),
     Retry(String),
 }
@@ -137,6 +143,10 @@ async fn run(
         }
         let reason = match res {
             Ended::Quit => break,
+            Ended::Reconnect => {
+                attempt = 0;
+                continue;
+            }
             Ended::Fatal(e) => {
                 events(NetEvent::Fatal(e));
                 break;
@@ -153,6 +163,7 @@ async fn run(
                 _ = &mut sleep => break,
                 m = rx.recv() => match m {
                     None | Some(Outgoing::Quit) => { endpoint.close().await; return; }
+                    Some(Outgoing::Reconnect(_)) => break,
                     Some(Outgoing::Msg(ClientMsg::UpdateSettings(s))) => settings = s,
                     Some(Outgoing::WatchClipboard) => clip.watch = true,
                     Some(Outgoing::Clipboard(text)) => clip.pending = Some(text),
@@ -276,6 +287,7 @@ async fn run_session(
     req_tx: &mpsc::UnboundedSender<Outgoing>,
     events: &Arc<dyn Fn(NetEvent) + Send + Sync>,
 ) -> Result<Ended> {
+    let started = Instant::now();
     let (mut send, mut recv) = conn.open_bi().await?;
     write_msg(&mut send, &ClientMsg::Hello { version: crate::PROTOCOL_VERSION, client_name: client_name.into(), settings: settings.clone() }).await?;
     let welcome = read_msg_extra::<HostMsg, HostExtras>(&mut recv);
@@ -438,6 +450,13 @@ async fn run_session(
                             let _ = tokio::time::timeout(Duration::from_millis(300), send.stopped()).await;
                             return anyhow::Ok(Ended::Quit);
                         }
+                        Some(Outgoing::Reconnect(at)) if at >= started => {
+                            let _ = write_msg(&mut send, &ClientMsg::Bye).await;
+                            send.finish();
+                            let _ = tokio::time::timeout(Duration::from_millis(300), send.stopped()).await;
+                            return anyhow::Ok(Ended::Reconnect);
+                        }
+                        Some(Outgoing::Reconnect(_)) => {}
                         Some(Outgoing::Msg(m)) => {
                             if let ClientMsg::UpdateSettings(s) = &m {
                                 *settings = s.clone();
