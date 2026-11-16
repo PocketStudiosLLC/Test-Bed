@@ -189,7 +189,7 @@ impl Dialer {
     async fn new(host: &KnownHost) -> Result<Self> {
         if host.internet {
             let relay = crate::config::ClientConfig::load().map(|c| c.relay).unwrap_or_default();
-            Ok(Dialer::Internet(crate::internet::client_endpoint(&relay).await?))
+            Ok(Dialer::Internet(crate::internet::shared_client_endpoint(&relay).await?))
         } else {
             Ok(Dialer::Lan(transport::client_endpoint()?))
         }
@@ -201,7 +201,8 @@ impl Dialer {
                 e.close(0u32.into(), b"bye");
                 e.wait_idle().await;
             }
-            Dialer::Internet(e) => e.close().await,
+            // Shared with the PC tab and other viewers: it stays up.
+            Dialer::Internet(_) => {}
         }
     }
 }

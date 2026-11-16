@@ -97,6 +97,11 @@ struct State {
     switching: Option<Instant>,
     /// Files handed to the connection and not yet saved or failed.
     files_pending: u32,
+    /// The host's last answer on the control stream (a pong).
+    last_clock: Option<Instant>,
+    /// Keys, buttons and scrolls sent since the last log line.
+    inputs_sent: u32,
+    logged_at: Option<Instant>,
 }
 
 pub struct Viewer {
@@ -401,6 +406,9 @@ impl Viewer {
     }
 
     fn send(&self, m: ClientMsg) {
+        if matches!(m, ClientMsg::Key { .. } | ClientMsg::Button { .. } | ClientMsg::Scroll { .. }) {
+            self.state.borrow_mut().inputs_sent += 1;
+        }
         let _ = self.net.tx.send(Outgoing::Msg(m));
     }
 
@@ -505,6 +513,7 @@ impl Viewer {
                 }
             }
             NetEvent::Connected { mut monitors, host_os, .. } => {
+                tracing::info!("remote {}: connected ({})", self.host.name, host_os.as_deref().unwrap_or("os unknown"));
                 monitors.sort_by_key(|m| (m.y, m.x));
                 {
                     let mut s = self.state.borrow_mut();
@@ -531,6 +540,7 @@ impl Viewer {
             NetEvent::Clock { rtt_us, offset_us } => {
                 let mut s = self.state.borrow_mut();
                 s.rtt_us = rtt_us;
+                s.last_clock = Some(Instant::now());
                 if offset_us != i64::MIN {
                     s.offset_us = Some(offset_us);
                 }
@@ -538,14 +548,19 @@ impl Viewer {
             NetEvent::FramesDropped(_) => {}
             // Only the phone app subscribes to the host's clipboard.
             NetEvent::Clipboard(_) => {}
-            NetEvent::Notice(text) => self.flash(&text),
+            NetEvent::Notice(text) => {
+                tracing::info!("remote {}: notice: {text}", self.host.name);
+                self.flash(&text);
+            }
             NetEvent::Disconnected { reason } => {
+                tracing::info!("remote {}: disconnected: {reason}", self.host.name);
                 self.switch_failed(&format!("{} needs Test Bed to switch sides", self.host.name));
                 self.state.borrow_mut().connected = false;
                 self.update_grab();
                 self.show_status("Disconnected", &reason);
             }
             NetEvent::Reconnecting { retry_in, reason, .. } => {
+                tracing::info!("remote {}: reconnecting in {retry_in:?}: {reason}", self.host.name);
                 self.switch_failed(&format!("{} needs Test Bed to switch sides", self.host.name));
                 self.state.borrow_mut().connected = false;
                 self.update_grab();
@@ -825,6 +840,26 @@ impl Viewer {
         let dt = at.elapsed().as_secs_f64();
         if dt < 1.0 {
             return;
+        }
+        // Every 5 s: is the host still answering on the control stream (where
+        // keys and clicks go), and was there input to answer.
+        if s.connected && s.logged_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            let pong = s.last_clock.map(|t| format!("{:.1} s ago", t.elapsed().as_secs_f32())).unwrap_or_else(|| "never".into());
+            tracing::debug!(
+                "remote {}: {:.0} fps, rtt {:.0} ms, last pong {pong}, {} inputs sent, forwarding {}, selected {}, window active {}",
+                self.host.name,
+                s.frames as f64 / dt,
+                s.rtt_us as f64 / 1000.0,
+                s.inputs_sent,
+                s.forwarding,
+                self.selected.get(),
+                self.window.is_active()
+            );
+            if s.last_clock.is_some_and(|t| t.elapsed() > Duration::from_secs(2)) {
+                tracing::warn!("remote {}: the host stopped answering on the control stream", self.host.name);
+            }
+            s.inputs_sent = 0;
+            s.logged_at = Some(Instant::now());
         }
         let text = if s.connected {
             let lat = if s.latency_n > 0 { format!("{:.0} ms", s.latency_us as f64 / s.latency_n as f64 / 1000.0) } else { "– ms".into() };

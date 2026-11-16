@@ -85,8 +85,8 @@ pub async fn host_endpoint(relay: &str) -> Result<Endpoint> {
 }
 
 /// The viewer's endpoint: only dials out, so it looks hosts up but publishes
-/// nothing.
-pub async fn client_endpoint(relay: &str) -> Result<Endpoint> {
+/// nothing. Use [`shared_client_endpoint`]: there must be only one.
+async fn client_endpoint(relay: &str) -> Result<Endpoint> {
     Endpoint::builder(presets::Minimal)
         .address_lookup(PkarrResolver::n0_dns())
         .secret_key(secret_key(Role::Client)?)
@@ -95,6 +95,36 @@ pub async fn client_endpoint(relay: &str) -> Result<Endpoint> {
         .bind()
         .await
         .context("starting the internet endpoint")
+}
+
+/// The runtime the shared endpoint lives on. It outlives every caller's:
+/// each viewer's connection has a runtime of its own, gone when it closes.
+fn endpoint_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("iroh-client")
+            .enable_all()
+            .build()
+            .expect("failed to start the internet endpoint's runtime")
+    })
+}
+
+/// This PC's one viewer-side endpoint, for every viewer, probe and pairing.
+/// A relay keeps one connection per endpoint id: a second endpoint with the
+/// same key knocks the first off it, and the host's packets then go to
+/// whichever one holds it. With the PC tab probing in the background, that
+/// left a viewer's video playing (it can come straight from the host) while
+/// clicks and keys stopped after a moment. `relay` counts the first time.
+pub async fn shared_client_endpoint(relay: &str) -> Result<Endpoint> {
+    static EP: tokio::sync::OnceCell<Endpoint> = tokio::sync::OnceCell::const_new();
+    EP.get_or_try_init(|| {
+        let relay = relay.to_string();
+        async move { endpoint_runtime().spawn(async move { client_endpoint(&relay).await }).await.context("starting the internet endpoint")? }
+    })
+    .await
+    .cloned()
 }
 
 /// Where to find a host: its endpoint id, and its relay if known.
@@ -111,8 +141,12 @@ pub fn host_addr(host: &KnownHost) -> Result<EndpointAddr> {
 
 pub async fn connect(endpoint: &Endpoint, host: &KnownHost, alpn: &[u8]) -> Result<Conn> {
     let addr = host_addr(host)?;
-    let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, alpn))
+    let (ep, alpn) = (endpoint.clone(), alpn.to_vec());
+    // On the endpoint's runtime: whatever the dial spawns must outlive the caller's.
+    let dial = endpoint_runtime().spawn(async move { tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, &alpn)).await });
+    let conn = dial
         .await
+        .context("dialing")?
         .map_err(|_| anyhow!("{} didn't answer over the internet; is it on, with internet access allowed?", host.name))?
         .with_context(|| format!("connecting to {}", host.name))?;
     Ok(conn.into())
@@ -154,7 +188,7 @@ impl Invite {
 /// `internet_hosts.toml`. `name` is how this PC is shown on the host.
 pub async fn pair(invite: &str, name: &str, relay: &str) -> Result<KnownHost> {
     let invite = Invite::decode(invite)?;
-    let ep = client_endpoint(relay).await?;
+    let ep = shared_client_endpoint(relay).await?;
     let host = KnownHost {
         name: String::new(),
         address: invite.relay.as_ref().map(|r| r.to_string()).unwrap_or_default(),
@@ -170,7 +204,6 @@ pub async fn pair(invite: &str, name: &str, relay: &str) -> Result<KnownHost> {
         r
     }
     .await;
-    ep.close().await;
     let paired = res?;
     let now = crate::unix_now();
     let host = KnownHost { name: paired.peer_name, fingerprint: paired.peer_fingerprint, last_seen: Some(now), ..host };
@@ -180,20 +213,13 @@ pub async fn pair(invite: &str, name: &str, relay: &str) -> Result<KnownHost> {
     Ok(host)
 }
 
-/// One endpoint for repeated probes (the PC tab checks every few seconds),
-/// kept connected to its relay. Bound to the runtime that first asks.
-async fn shared_endpoint(relay: &str) -> Result<Endpoint> {
-    static EP: tokio::sync::OnceCell<Endpoint> = tokio::sync::OnceCell::const_new();
-    EP.get_or_try_init(|| client_endpoint(relay)).await.cloned()
-}
-
 /// Check which internet hosts are online. All are probed at once.
 pub async fn probe(hosts: &[KnownHost], relay: &str, timeout: Duration) -> Vec<ProbeResult> {
     let fail = |h: &KnownHost, e: String| ProbeResult { name: h.name.clone(), address: h.address.clone(), online: false, rtt_ms: None, error: Some(e) };
     if hosts.is_empty() {
         return Vec::new();
     }
-    let ep = match shared_endpoint(relay).await {
+    let ep = match shared_client_endpoint(relay).await {
         Ok(e) => e,
         Err(e) => return hosts.iter().map(|h| fail(h, format!("{e:#}"))).collect(),
     };
@@ -202,7 +228,7 @@ pub async fn probe(hosts: &[KnownHost], relay: &str, timeout: Duration) -> Vec<P
         .cloned()
         .map(|h| {
             let ep = ep.clone();
-            tokio::spawn(async move {
+            endpoint_runtime().spawn(async move {
                 let t = Instant::now();
                 let addr = host_addr(&h)?;
                 let conn = tokio::time::timeout(timeout, ep.connect(addr, ALPN_PROBE)).await.map_err(|_| anyhow!("timed out"))??;
