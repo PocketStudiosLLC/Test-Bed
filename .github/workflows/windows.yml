@@ -95,7 +95,7 @@ jobs:
           other networks" and send the invite code to the other computer.
           EOF
           version="${GITHUB_REF_NAME#v}"
-          [ "$GITHUB_REF_TYPE" = tag ] || version="dev-$(git rev-parse --short HEAD)"
+          [ "$GITHUB_REF_TYPE" = tag ] || version="dev-${GITHUB_SHA:0:7}"
           (cd dist && zip -qr "../TestBed-windows-x64-$version.zip" TestBed)
           echo "ZIP=TestBed-windows-x64-$version.zip" >> "$GITHUB_ENV"
           echo "VERSION=$version" >> "$GITHUB_ENV"
