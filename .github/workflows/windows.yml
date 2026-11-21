@@ -58,6 +58,9 @@ jobs:
           # defining their include guards.
           guards=$(grep -ho '^#ifndef __AMX[A-Za-z0-9_]*_H\b' /clang64/lib/clang/*/include/amx*.h | sed 's/^#ifndef /-D/' | sort -u | tr '\n' ' ')
           [ -n "$guards" ] || { echo "no AMX headers found"; exit 1; }
+          # FFmpeg 9.1's CUDA header needs CUDA's own types, which MSYS2
+          # doesn't ship; Test Bed doesn't use CUDA, so skip it the same way.
+          guards="$guards -DAVUTIL_HWCONTEXT_CUDA_H"
           export BINDGEN_EXTRA_CLANG_ARGS="$guards"
           echo "BINDGEN_EXTRA_CLANG_ARGS=$guards" >> "$GITHUB_ENV"
           cargo build --release --locked -p test-bed -p ac-remote-host
