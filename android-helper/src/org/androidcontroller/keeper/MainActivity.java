@@ -22,12 +22,13 @@ import android.widget.TextView;
 
 /** Status and the few switches; everything is built in code (no resources). Always dark. */
 public final class MainActivity extends Activity {
-    private static final int BG = 0xFF121212;
-    private static final int CARD = 0xFF1E1E1E;
-    private static final int TEXT = 0xFFECECEC;
-    private static final int DIM = 0xFF9E9E9E;
-    private static final int GOOD = 0xFF81C784;
-    private static final int BAD = 0xFFFFB74D;
+    // The PC app's colours (libadwaita, dark).
+    private static final int BG = Ui.WINDOW_BG;
+    private static final int CARD = Ui.CARD_BG;
+    private static final int TEXT = Ui.FG;
+    private static final int DIM = Ui.DIM;
+    private static final int GOOD = Ui.SUCCESS;
+    private static final int BAD = Ui.WARNING;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private TextView wd;
@@ -75,16 +76,11 @@ public final class MainActivity extends Activity {
         TextView title = text("Test Bed", 20, TEXT);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         col.addView(title);
-        TextView about = text("Control your PCs from this phone, and let Test Bed on your PC use it", 13, DIM);
-        about.setPadding(0, dp(2), 0, dp(4));
-        col.addView(about);
 
-        col.addView(heading("Remote PCs"));
-        remotePcs = new RemotePcs(this, card(col));
+        remotePcs = new RemotePcs(this, card(section(col, "Remote PCs")));
 
-        col.addView(heading("Wireless debugging"));
-
-        LinearLayout status = card(col);
+        LinearLayout wireless = section(col, "Wireless debugging");
+        LinearLayout status = card(wireless);
         wd = row(status, "Wireless debugging");
         wifi = row(status, "Wi-Fi");
         perm = row(status, "Permission");
@@ -100,9 +96,13 @@ public final class MainActivity extends Activity {
             render();
         });
         Button dev = button("Dev options", v -> startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)));
-        buttons.addView(now, weighted());
+        Ui.style(now, Ui.Kind.SUGGESTED);
+        LinearLayout.LayoutParams first = weighted();
+        first.setMarginEnd(dp(8));
+        buttons.addView(now, first);
         buttons.addView(dev, weighted());
-        col.addView(buttons);
+        buttons.setPadding(0, 0, 0, dp(8));
+        wireless.addView(buttons);
 
         battery = button("Allow running in background", v -> {
             Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName()));
@@ -112,9 +112,10 @@ public final class MainActivity extends Activity {
                 startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
             }
         });
-        col.addView(battery);
+        Ui.style(battery, Ui.Kind.SUGGESTED);
+        wireless.addView(battery);
 
-        LinearLayout opts = card(col);
+        LinearLayout opts = card(wireless);
         keep = toggle(opts, "Keep wireless debugging on");
         keep.setOnCheckedChangeListener((b, on) -> {
             if (on != Keeper.active(this)) Keeper.setActive(this, on);
@@ -188,13 +189,13 @@ public final class MainActivity extends Activity {
     }
 
     private void addMonitorSection(LinearLayout col) {
-        col.addView(heading("PC monitor"));
-        LinearLayout c = card(col);
+        LinearLayout c = card(section(col, "PC monitor"));
         monitor = button("", v -> {
             Monitor.startServer(this);
             Monitor.userToggle(this, !Monitor.active());
             render();
         });
+        Ui.style(monitor, Ui.Kind.SUGGESTED);
         c.addView(monitor);
         monitorStatus = text("", 13, DIM);
         c.addView(monitorStatus);
@@ -231,8 +232,7 @@ public final class MainActivity extends Activity {
 
     /** "PC connection without ADB": for phones with no wireless debugging and no USB cable. */
     private void addDirectSection(LinearLayout col) {
-        col.addView(heading("Without ADB"));
-        LinearLayout c = card(col);
+        LinearLayout c = card(section(col, "Without ADB"));
         direct = toggle(c, "Allow PC connection");
         direct.setOnCheckedChangeListener((b, on) -> {
             if (on == Direct.enabled(this)) return;
@@ -274,6 +274,7 @@ public final class MainActivity extends Activity {
             Direct.forgetPcs(this);
             render();
         });
+        Ui.style(forget, Ui.Kind.DESTRUCTIVE);
         c.addView(forget);
     }
 
@@ -320,6 +321,20 @@ public final class MainActivity extends Activity {
         t.setTextSize(sp);
         t.setTextColor(color);
         return t;
+    }
+
+    /**
+     * A dropdown: a heading that opens and closes what is under it. Each
+     * remembers whether it was open; all start open.
+     */
+    private LinearLayout section(LinearLayout col, String title) {
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        TextView h = heading(title);
+        Dropdown.attach(this, h, body, title);
+        col.addView(h);
+        col.addView(body);
+        return body;
     }
 
     private TextView heading(String s) {
@@ -370,15 +385,20 @@ public final class MainActivity extends Activity {
         s.setTextSize(15);
         s.setTextColor(TEXT);
         s.setPadding(0, dp(6), 0, dp(6));
+        Ui.style(s);
         parent.addView(s);
         return s;
     }
 
+    /** A round button, as on the PC; a full-width one in a column, with a gap above. */
     private Button button(String label, View.OnClickListener onClick) {
-        Button b = new Button(this);
-        b.setText(label);
-        b.setAllCaps(false);
+        Button b = Ui.button(this, label, Ui.Kind.NORMAL);
+        b.setPadding(dp(16), dp(10), dp(16), dp(10));
         b.setOnClickListener(onClick);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(8);
+        b.setLayoutParams(lp);
         return b;
     }
 

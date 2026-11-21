@@ -196,6 +196,7 @@ pub async fn pair(invite: &str, name: &str, relay: &str) -> Result<KnownHost> {
         paired_at: crate::unix_now(),
         last_seen: None,
         internet: true,
+        link: None,
     };
     let res = async {
         let conn = connect(&ep, &KnownHost { name: "the other PC".into(), ..host.clone() }, ALPN_PAIR).await?;
@@ -214,6 +215,35 @@ pub async fn pair(invite: &str, name: &str, relay: &str) -> Result<KnownHost> {
 }
 
 /// Check which internet hosts are online. All are probed at once.
+/// Over `conn`, a session with the LAN host `host`: asks it to let this
+/// client in over the internet too, and remembers how to reach it there
+/// (`known_hosts.toml`'s `link`). The session already proves who both sides
+/// are, so no code is needed. Returns whether it is newly linked.
+pub async fn link(conn: &Conn, host: &KnownHost) -> Result<bool> {
+    use crate::proto::{read_msg, write_link, LinkReply, LinkRequest};
+    let client_id = endpoint_id(Role::Client)?.to_string();
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_link(&mut send, &LinkRequest { client_id }).await?;
+    send.finish();
+    let reply = tokio::time::timeout(Duration::from_secs(10), read_msg::<LinkReply>(&mut recv)).await;
+    let link = match reply {
+        Err(_) | Ok(Ok(None)) | Ok(Err(_)) => bail!("{} needs a newer Test Bed to be reached from other networks", host.name),
+        Ok(Ok(Some(LinkReply::Refused { text }))) => bail!(text),
+        Ok(Ok(Some(LinkReply::Linked { host_id, relay }))) => {
+            host_id.parse::<EndpointId>().map_err(|e| anyhow!("{} sent an invalid endpoint id: {e}", host.name))?;
+            crate::trust::InternetLink { id: host_id, relay: relay.unwrap_or_default() }
+        }
+    };
+    let mut kh = KnownHosts::load()?;
+    let Some(h) = kh.hosts.iter_mut().find(|h| h.fingerprint == host.fingerprint) else { return Ok(false) };
+    let new = h.link.as_ref().map(|l| &l.id) != Some(&link.id);
+    if h.link.as_ref() != Some(&link) {
+        h.link = Some(link);
+        kh.save()?;
+    }
+    Ok(new)
+}
+
 pub async fn probe(hosts: &[KnownHost], relay: &str, timeout: Duration) -> Vec<ProbeResult> {
     let fail = |h: &KnownHost, e: String| ProbeResult { name: h.name.clone(), address: h.address.clone(), online: false, rtt_ms: None, error: Some(e) };
     if hosts.is_empty() {

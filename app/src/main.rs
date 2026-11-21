@@ -18,6 +18,7 @@ mod preferences;
 #[cfg(unix)]
 mod qr;
 mod remote;
+mod remote_files;
 mod remote_viewer;
 #[cfg(unix)]
 mod slot_card;

@@ -143,8 +143,16 @@ impl TestBar {
             input_box.append(*w);
         }
 
+        // Input and captures wrap as one: on a line of their own (a narrow
+        // window) input stays left and captures right, as they do beside the app.
+        let input_caps = gtk::Box::builder().spacing(18).hexpand(true).build();
+        let gap = gtk::Box::builder().hexpand(true).build();
+        input_caps.append(&input_box);
+        input_caps.append(&gap);
+        input_caps.append(&cap_box);
+
         // Two rows: phones, the tabs and the run (at the far right); then the
-        // app, captures and input (wrapping only when the window is too narrow).
+        // app, input and captures (wrapping only when the window is too narrow).
         let flow = |parts: &[&gtk::Box]| {
             let f = gtk::FlowBox::builder()
                 .selection_mode(gtk::SelectionMode::None)
@@ -160,7 +168,7 @@ impl TestBar {
         };
         let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let top = gtk::CenterBox::builder().start_widget(&phones_box).center_widget(tabs).end_widget(&run_box).build();
-        let phone_tools = flow(&[&app_box, &cap_box, &input_box]);
+        let phone_tools = flow(&[&app_box, &input_caps]);
         row.append(&top);
         row.append(&phone_tools);
         row.add_css_class("test-bar");

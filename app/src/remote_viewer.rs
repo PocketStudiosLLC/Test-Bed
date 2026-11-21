@@ -97,6 +97,8 @@ struct State {
     switching: Option<Instant>,
     /// Files handed to the connection and not yet saved or failed.
     files_pending: u32,
+    /// Files asked of the PC and not yet saved or failed.
+    takes_pending: u32,
     /// The host's last answer on the control stream (a pong).
     last_clock: Option<Instant>,
     /// Keys, buttons and scrolls sent since the last log line.
@@ -127,6 +129,11 @@ pub struct Viewer {
     switch_content: adw::ButtonContent,
     send_button: gtk::Button,
     send_content: adw::ButtonContent,
+    receive_button: gtk::Button,
+    receive_content: adw::ButtonContent,
+    screenshot_button: gtk::Button,
+    /// Receive files: the PC's folders, while open.
+    browser: RefCell<Option<Rc<crate::remote_files::Browser>>>,
     focus_button: gtk::ToggleButton,
     transfer: gtk::Label,
     /// The one viewer of several that gets the keyboard and mouse.
@@ -234,6 +241,17 @@ impl Viewer {
             .tooltip_text(format!("Send files to the Downloads folder on {}. You can also drop files on its screen.", host.name))
             .sensitive(false)
             .build();
+        let receive_content = adw::ButtonContent::builder().icon_name("folder-download-symbolic").label("Receive files").build();
+        let receive_button = gtk::Button::builder()
+            .child(&receive_content)
+            .tooltip_text(format!("Copy files from {} to the Downloads folder on this PC", host.name))
+            .sensitive(false)
+            .build();
+        let screenshot_button = gtk::Button::builder()
+            .icon_name("camera-photo-symbolic")
+            .tooltip_text(format!("Save a screenshot of {} to Pictures/Screenshots on this PC", host.name))
+            .sensitive(false)
+            .build();
         let transfer = gtk::Label::builder().visible(false).css_classes(["dim-label", "numeric"]).build();
         let mute_button = gtk::ToggleButton::builder()
             .icon_name("audio-volume-muted-symbolic")
@@ -265,6 +283,8 @@ impl Viewer {
         bar.append(&stats);
         bar.append(&transfer);
         bar.append(&send_button);
+        bar.append(&receive_button);
+        bar.append(&screenshot_button);
         bar.append(&switch_button);
         bar.append(&task_manager_button);
         bar.append(&mute_button);
@@ -297,6 +317,10 @@ impl Viewer {
             switch_content,
             send_button,
             send_content,
+            receive_button,
+            receive_content,
+            screenshot_button,
+            browser: RefCell::default(),
             focus_button,
             transfer,
             selected: Cell::new(true),
@@ -330,6 +354,22 @@ impl Viewer {
             v.send_button.connect_clicked(move |_| {
                 if let Some(v) = weak.upgrade() {
                     v.choose_files();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&v);
+            v.receive_button.connect_clicked(move |_| {
+                if let Some(v) = weak.upgrade() {
+                    v.browse_files();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&v);
+            v.screenshot_button.connect_clicked(move |_| {
+                if let Some(v) = weak.upgrade() {
+                    v.screenshot();
                 }
             });
         }
@@ -415,7 +455,13 @@ impl Viewer {
     /// Keyboard and mouse go to the PC.
     fn active(&self) -> bool {
         let s = self.state.borrow();
-        s.connected && s.forwarding && self.selected.get() && self.window.is_active() && !self.closed.get()
+        s.connected
+            && s.forwarding
+            && self.selected.get()
+            && self.window.is_active()
+            && !self.closed.get()
+            // Typing in Receive files stays on this PC.
+            && self.browser.borrow().is_none()
     }
 
     /// Gives this viewer the keyboard and mouse, or takes them away.
@@ -449,6 +495,7 @@ impl Viewer {
         // Small tiles: buttons without words, no figures.
         self.stats.set_visible(!compact);
         self.send_content.set_label(if compact { "" } else { "Send file" });
+        self.receive_content.set_label(if compact { "" } else { "Receive files" });
         self.switch_content.set_label(if compact { "" } else { "Switch sides" });
         if fullscreen {
             self.root.remove_css_class("card");
@@ -523,6 +570,8 @@ impl Viewer {
                 self.show_status("", "");
                 self.switch_button.set_sensitive(true);
                 self.send_button.set_sensitive(true);
+                self.receive_button.set_sensitive(true);
+                self.screenshot_button.set_sensitive(true);
                 self.task_manager_button.set_visible(host_os.as_deref() == Some("windows"));
                 self.task_manager_button.set_sensitive(true);
                 self.rebuild_monitors();
@@ -557,6 +606,7 @@ impl Viewer {
                 self.switch_failed(&format!("{} needs Test Bed to switch sides", self.host.name));
                 self.state.borrow_mut().connected = false;
                 self.update_grab();
+                self.transfers_lost();
                 self.show_status("Disconnected", &reason);
             }
             NetEvent::Reconnecting { retry_in, reason, .. } => {
@@ -564,6 +614,7 @@ impl Viewer {
                 self.switch_failed(&format!("{} needs Test Bed to switch sides", self.host.name));
                 self.state.borrow_mut().connected = false;
                 self.update_grab();
+                self.transfers_lost();
                 self.show_status(&format!("Reconnecting in {:.0} s…", retry_in.as_secs_f32().ceil()), &reason);
             }
             NetEvent::Fatal(msg) => {
@@ -574,6 +625,7 @@ impl Viewer {
                     s.fatal = true;
                 }
                 self.update_grab();
+                self.transfers_lost();
                 tracing::warn!("remote {}: {msg}", self.host.name);
                 // The connection gave up for good: nothing to reconnect.
                 self.reconnect_button.set_sensitive(false);
@@ -595,6 +647,28 @@ impl Viewer {
                 self.file_done();
                 self.tab.viewer_message(&format!("Couldn't send {name}: {error}"));
             }
+            NetEvent::Listing { id, result } => {
+                let browser = self.browser.borrow().clone();
+                if let Some(b) = browser {
+                    b.listing(id, result);
+                }
+            }
+            NetEvent::TakeProgress { name, got, total } => {
+                let pct = (got * 100).checked_div(total).unwrap_or(100);
+                let waiting = self.state.borrow().takes_pending.saturating_sub(1);
+                let more = if waiting > 0 { format!(" (+{waiting})") } else { String::new() };
+                self.transfer.set_label(&format!("Receiving {name} · {pct}%{more}"));
+                self.transfer.set_visible(true);
+            }
+            NetEvent::Taken { name, path } => {
+                self.take_done();
+                tracing::info!("remote {}: received {}", self.host.name, path.display());
+                self.tab.viewer_message(&format!("Received {name} from {}: {}", self.host.name, path.display()));
+            }
+            NetEvent::TakeFailed { name, error } => {
+                self.take_done();
+                self.tab.viewer_message(&format!("Couldn't receive {name}: {error}"));
+            }
             NetEvent::SwitchRefused(text) => {
                 if self.state.borrow().switching.is_some() {
                     self.switch_failed(&text);
@@ -603,10 +677,14 @@ impl Viewer {
                 }
             }
             NetEvent::Frame { .. } | NetEvent::Audio { .. } => {}
+            // Only the phone app links LAN PCs for the internet.
+            NetEvent::InternetLinked(_) | NetEvent::Route { .. } => {}
         }
         if !self.state.borrow().connected {
             self.switch_button.set_sensitive(false);
             self.send_button.set_sensitive(false);
+            self.receive_button.set_sensitive(false);
+            self.screenshot_button.set_sensitive(false);
             self.task_manager_button.set_sensitive(false);
         }
     }
@@ -701,10 +779,118 @@ impl Viewer {
         let left = {
             let mut s = self.state.borrow_mut();
             s.files_pending = s.files_pending.saturating_sub(1);
-            s.files_pending
+            s.files_pending + s.takes_pending
         };
         if left == 0 {
             self.transfer.set_visible(false);
+        }
+    }
+
+    fn take_done(&self) {
+        let left = {
+            let mut s = self.state.borrow_mut();
+            s.takes_pending = s.takes_pending.saturating_sub(1);
+            s.files_pending + s.takes_pending
+        };
+        if left == 0 {
+            self.transfer.set_visible(false);
+        }
+    }
+
+    /// The connection dropped: files still queued won't go either way.
+    fn transfers_lost(&self) {
+        let lost = {
+            let mut s = self.state.borrow_mut();
+            std::mem::take(&mut s.files_pending) + std::mem::take(&mut s.takes_pending)
+        };
+        if lost > 0 {
+            self.transfer.set_visible(false);
+            let what = if lost == 1 { "A file transfer".to_string() } else { format!("{lost} file transfers") };
+            self.tab.viewer_message(&format!("{what} stopped: the connection to {} dropped", self.host.name));
+        }
+    }
+
+    /// Saves the picture shown now as a PNG in Pictures/Screenshots.
+    fn screenshot(&self) {
+        let Some(texture) = self.picture.paintable().and_downcast::<gdk::Texture>() else {
+            self.tab.viewer_message(&format!("No picture from {} yet", self.host.name));
+            return;
+        };
+        // Read back here (a dma-buf texture needs GTK's GL); written off the main thread.
+        let png = texture.save_to_png_bytes();
+        let pictures = glib::user_special_dir(glib::UserDirectory::Pictures).unwrap_or_else(|| glib::home_dir().join("Pictures"));
+        let dir = pictures.join("Screenshots");
+        let when = glib::DateTime::now_local().ok().and_then(|d| d.format("%Y-%m-%d %H-%M-%S").ok()).map(|s| s.to_string()).unwrap_or_default();
+        let name = ac_remote::files::safe_name(&format!("{} {when}.png", self.host.name));
+        let (tx, rx) = async_channel::bounded::<Result<std::path::PathBuf, String>>(1);
+        std::thread::spawn(move || {
+            let r = std::fs::create_dir_all(&dir).and_then(|()| {
+                let path = ac_remote::files::unique_path(&dir, &name);
+                std::fs::write(&path, &png).map(|()| path)
+            });
+            let _ = tx.send_blocking(r.map_err(|e| format!("{e}")));
+        });
+        let tab = self.tab.clone();
+        let host = self.host.name.clone();
+        glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(path)) => tab.viewer_message(&format!("Screenshot of {host} saved: {}", path.display())),
+                Ok(Err(e)) => tab.viewer_message(&format!("Couldn't save the screenshot: {e}")),
+                Err(_) => {}
+            }
+        });
+    }
+
+    /// Receive files: browse the PC's folders and copy files from it.
+    fn browse_files(self: &Rc<Self>) {
+        if !self.state.borrow().connected || self.browser.borrow().is_some() {
+            return;
+        }
+        let list = {
+            let tx = self.net.tx.clone();
+            Box::new(move |id, dir, name| {
+                let _ = tx.send(Outgoing::ListFiles { id, dir, name });
+            })
+        };
+        let take = {
+            let weak = Rc::downgrade(self);
+            Box::new(move |dir: String, names: Vec<String>| {
+                if let Some(v) = weak.upgrade() {
+                    v.take_files(dir, names);
+                }
+            })
+        };
+        let closed = {
+            let weak = Rc::downgrade(self);
+            Box::new(move || {
+                if let Some(v) = weak.upgrade() {
+                    v.browser.borrow_mut().take();
+                    v.update_grab();
+                    v.picture.grab_focus();
+                }
+            })
+        };
+        // Keys held now would stay down on the PC while the dialog has them.
+        self.release_all();
+        let ask = crate::remote_files::Ask { list, take, closed };
+        let b = crate::remote_files::Browser::open(&self.window, &self.host.name, ask);
+        *self.browser.borrow_mut() = Some(b);
+        self.update_grab();
+    }
+
+    fn take_files(&self, dir: String, names: Vec<String>) {
+        if !self.state.borrow().connected {
+            self.tab.viewer_message(&format!("Connect to {} to receive files", self.host.name));
+            return;
+        }
+        let dest = ac_remote::files::downloads_dir();
+        for name in names {
+            self.state.borrow_mut().takes_pending += 1;
+            let _ = self.net.tx.send(Outgoing::TakeFile { dir: dir.clone(), name, dest: dest.clone() });
+        }
+        if !self.transfer.is_visible() {
+            self.transfer.set_label("Receiving…");
+            self.transfer.set_visible(true);
         }
     }
 
@@ -1130,6 +1316,8 @@ impl Viewer {
         self.update_grab();
         self.switch_button.set_sensitive(false);
         self.send_button.set_sensitive(false);
+        self.receive_button.set_sensitive(false);
+        self.screenshot_button.set_sensitive(false);
         self.task_manager_button.set_sensitive(false);
         self.show_status(&format!("Reconnecting to {}…", self.host.name), "");
         let _ = self.net.tx.send(Outgoing::Reconnect(Instant::now()));
@@ -1140,6 +1328,10 @@ impl Viewer {
     pub fn close(&self) {
         if self.closed.replace(true) {
             return;
+        }
+        let browser = self.browser.borrow_mut().take();
+        if let Some(b) = browser {
+            b.close();
         }
         if self.state.borrow().connected {
             self.release_all();

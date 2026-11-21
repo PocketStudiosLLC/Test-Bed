@@ -1,6 +1,8 @@
-//! Sending files to a shared PC: one stream per file, inside the session
-//! (see [`FileOffer`] for the exchange). The host saves to Downloads, or to
-//! the folder the file was dropped on when it can tell.
+//! Files to and from a shared PC: one stream per file, inside the session.
+//! Sending (see [`FileOffer`]): the host saves to Downloads, or to the folder
+//! the file was dropped on when it can tell. Taking (see [`FetchRequest`]):
+//! the viewer browses the host's folders and saves what it picks in its own
+//! Downloads.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,7 +11,9 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::net::{Conn, RecvStream, SendStream};
-use crate::proto::{read_msg, write_msg, FileOffer, FileReply};
+use crate::proto::{
+    read_file_head, read_msg, write_fetch, write_msg, DirEntry, FetchReply, FetchRequest, FileHead, FileOffer, FileReply, Listing, Place,
+};
 
 /// A host that hasn't answered an offer by then can't receive files (an
 /// older Test Bed never reads the stream).
@@ -17,6 +21,9 @@ pub const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
 const CHUNK: usize = 256 * 1024;
 /// Longest file name kept, in characters.
 const MAX_NAME: usize = 200;
+/// A listing stops growing past about this many bytes (control messages
+/// are capped at 1 MiB).
+const LISTING_BUDGET: usize = 768 * 1024;
 
 /// This user's Downloads folder.
 pub fn downloads_dir() -> PathBuf {
@@ -99,14 +106,56 @@ pub async fn send(conn: &Conn, path: &Path, drop_at: Option<(f32, f32)>, mut pro
     }
 }
 
-/// The host's side of one file stream. `folder` picks the folder from the
-/// drop point; it runs on a blocking thread. Returns the saved file.
-pub async fn receive(
-    mut send: SendStream,
+/// What the host did with one file stream.
+#[derive(Debug)]
+pub enum Served {
+    /// Saved a file the viewer sent, here.
+    Received(PathBuf),
+    /// Sent the viewer this file.
+    Sent(PathBuf),
+    /// Listed a folder for the viewer.
+    Listed,
+}
+
+/// The host's side of one file stream. `folder` picks the folder for a
+/// file sent to it, from the drop point; it runs on a blocking thread.
+pub async fn serve(
+    send: SendStream,
     mut recv: RecvStream,
     folder: impl FnOnce(Option<(f32, f32)>) -> PathBuf + Send + 'static,
+) -> Result<Served> {
+    match read_file_head(&mut recv).await? {
+        None => bail!("empty file stream"),
+        Some(head) => serve_head(send, recv, head, folder).await,
+    }
+}
+
+/// [`serve`], for a stream whose first message the caller read already.
+/// A [`FileHead::Link`] is the caller's to answer: it is refused here.
+pub async fn serve_head(
+    mut send: SendStream,
+    recv: RecvStream,
+    head: FileHead,
+    folder: impl FnOnce(Option<(f32, f32)>) -> PathBuf + Send + 'static,
+) -> Result<Served> {
+    match head {
+        FileHead::Offer(offer) => receive(send, recv, offer, folder).await.map(Served::Received),
+        FileHead::Fetch(req) => answer_fetch(send, req).await,
+        FileHead::Link(_) => {
+            let text = "this PC can't link here".to_string();
+            write_msg(&mut send, &crate::proto::LinkReply::Refused { text: text.clone() }).await?;
+            send.finish();
+            bail!(text)
+        }
+    }
+}
+
+async fn receive(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    offer: FileOffer,
+    folder: impl FnOnce(Option<(f32, f32)>) -> PathBuf + Send + 'static,
 ) -> Result<PathBuf> {
-    let Some(offer) = read_msg::<FileOffer>(&mut recv).await? else { bail!("empty file stream") };
     let dir = tokio::task::spawn_blocking(move || folder(offer.drop_at)).await?;
     let name = safe_name(&offer.name);
     let opened = async {
@@ -166,6 +215,218 @@ pub async fn receive(
     }
 }
 
+// ---- Taking files from the host ------------------------------------------
+
+/// The host can't answer fetches (an older Test Bed, or RemoteLinux).
+const FETCH_UNSUPPORTED: &str = "the other PC can't share its files: update Test Bed there";
+
+async fn fetch(conn: &Conn, req: &FetchRequest) -> Result<(FetchReply, RecvStream)> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_fetch(&mut send, req).await?;
+    send.finish();
+    match tokio::time::timeout(OFFER_TIMEOUT, read_msg::<FetchReply>(&mut recv)).await {
+        Err(_) | Ok(Ok(None)) => bail!(FETCH_UNSUPPORTED),
+        Ok(Err(e)) => Err(e.context(FETCH_UNSUPPORTED)),
+        Ok(Ok(Some(FetchReply::Refused { text }))) => bail!(text),
+        Ok(Ok(Some(reply))) => Ok((reply, recv)),
+    }
+}
+
+/// The host's folder `dir` (its home if empty), or its subfolder `name`.
+pub async fn list(conn: &Conn, dir: &str, name: Option<&str>) -> Result<Listing> {
+    match fetch(conn, &FetchRequest::List { dir: dir.into(), name: name.map(Into::into) }).await? {
+        (FetchReply::Listing(l), _) => Ok(l),
+        (other, _) => bail!("unexpected answer {other:?}"),
+    }
+}
+
+/// Copies the host's file `name` in `dir` into `dest` (under a free name);
+/// `progress(got, total)` is called as bytes come in. Returns the saved file.
+pub async fn take(conn: &Conn, dir: &str, name: &str, dest: &Path, mut progress: impl FnMut(u64, u64)) -> Result<PathBuf> {
+    let (reply, mut recv) = fetch(conn, &FetchRequest::Get { dir: dir.into(), name: name.into() }).await?;
+    let FetchReply::Sending { name, size } = reply else { bail!("unexpected answer {reply:?}") };
+    let name = safe_name(&name);
+    tokio::fs::create_dir_all(dest).await.with_context(|| format!("can't save in {}", dest.display()))?;
+    let part = unique_path(dest, &format!("{name}.part"));
+    let mut f = tokio::fs::File::create(&part).await.with_context(|| format!("can't save in {}", dest.display()))?;
+    // Removes the partial file however this ends, the session dropping included.
+    let _cleanup = RemoveOnDrop(part.clone());
+    let copied = async {
+        let mut buf = vec![0u8; CHUNK];
+        let mut got = 0u64;
+        progress(0, size);
+        while let Some(n) = recv.read(&mut buf).await? {
+            got += n as u64;
+            if got > size {
+                bail!("more data than announced");
+            }
+            f.write_all(&buf[..n]).await?;
+            progress(got, size);
+        }
+        if got != size {
+            bail!("the transfer stopped after {got} of {size} bytes");
+        }
+        f.flush().await?;
+        anyhow::Ok(())
+    }
+    .await;
+    drop(f);
+    copied?;
+    let to = unique_path(dest, &name);
+    tokio::fs::rename(&part, &to).await?;
+    Ok(to)
+}
+
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        // Gone already once renamed.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn answer_fetch(mut send: SendStream, req: FetchRequest) -> Result<Served> {
+    let refuse = |text: String| FetchReply::Refused { text };
+    let served = match req {
+        FetchRequest::List { dir, name } => {
+            let reply = match tokio::task::spawn_blocking(move || list_dir(&dir, name.as_deref())).await? {
+                Ok(l) => FetchReply::Listing(l),
+                Err(e) => refuse(format!("{e:#}")),
+            };
+            write_msg(&mut send, &reply).await?;
+            Served::Listed
+        }
+        FetchRequest::Get { dir, name } => {
+            let opened = async {
+                let path = resolve(&dir, Some(&name))?;
+                let file = tokio::fs::File::open(&path).await.with_context(|| format!("can't open {}", path.display()))?;
+                let meta = file.metadata().await?;
+                if !meta.is_file() {
+                    bail!("{name} is a folder: only files can be taken");
+                }
+                anyhow::Ok((path, file, meta.len()))
+            }
+            .await;
+            let (path, file, size) = match opened {
+                Ok(o) => o,
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    write_msg(&mut send, &refuse(text.clone())).await?;
+                    send.finish();
+                    bail!(text);
+                }
+            };
+            write_msg(&mut send, &FetchReply::Sending { name, size }).await?;
+            // Exactly `size` bytes: a file that grows meanwhile is cut, one
+            // that shrinks ends short and the viewer throws it away.
+            let mut file = file.take(size);
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                let n = file.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                send.write_all(&buf[..n]).await?;
+            }
+            Served::Sent(path)
+        }
+    };
+    send.finish();
+    let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+    Ok(served)
+}
+
+/// `dir` (home if empty) and, if given, its child `name`, which must be a
+/// plain name.
+fn resolve(dir: &str, name: Option<&str>) -> Result<PathBuf> {
+    let base = if dir.is_empty() { home_dir() } else { PathBuf::from(dir) };
+    if !base.is_absolute() {
+        bail!("{dir} isn't a full path");
+    }
+    match name {
+        None => Ok(base),
+        Some(n) if n.is_empty() || n == "." || n == ".." || n.contains(['/', '\\']) => bail!("{n:?} isn't a file name"),
+        Some(n) => Ok(base.join(n)),
+    }
+}
+
+fn home_dir() -> PathBuf {
+    directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn list_dir(dir: &str, name: Option<&str>) -> Result<Listing> {
+    let path = resolve(dir, name)?;
+    let read = std::fs::read_dir(&path).with_context(|| format!("can't open {}", path.display()))?;
+    let mut entries: Vec<DirEntry> = read
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            // A name that isn't UTF-8 couldn't be asked for again.
+            let name = e.file_name().into_string().ok()?;
+            // Through symlinks, so a linked folder opens like a folder.
+            let meta = std::fs::metadata(e.path()).or_else(|_| e.metadata()).ok()?;
+            #[cfg(windows)]
+            let hidden = {
+                use std::os::windows::fs::MetadataExt;
+                name.starts_with('.') || meta.file_attributes() & 0x2 != 0
+            };
+            #[cfg(not(windows))]
+            let hidden = name.starts_with('.');
+            let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+            Some(DirEntry { dir: meta.is_dir(), hidden, size: if meta.is_dir() { 0 } else { meta.len() }, modified, name })
+        })
+        .collect();
+    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    let mut budget = LISTING_BUDGET;
+    let total = entries.len();
+    entries.retain(|e| {
+        let cost = e.name.len() + 32;
+        if cost > budget {
+            budget = 0;
+            return false;
+        }
+        budget -= cost;
+        true
+    });
+    Ok(Listing {
+        path: path.display().to_string(),
+        parent: path.parent().map(|p| p.display().to_string()),
+        omitted: (total - entries.len()) as u32,
+        entries,
+        places: places(),
+    })
+}
+
+/// Folders to start from on this PC.
+fn places() -> Vec<Place> {
+    let mut out = Vec::new();
+    let mut add = |name: &str, p: Option<&Path>| {
+        if let Some(p) = p.filter(|p| p.is_dir()) {
+            let path = p.display().to_string();
+            if !out.iter().any(|o: &Place| o.path == path) {
+                out.push(Place { name: name.into(), path });
+            }
+        }
+    };
+    if let Some(d) = directories::UserDirs::new() {
+        add("Home", Some(d.home_dir()));
+        add("Desktop", d.desktop_dir());
+        add("Documents", d.document_dir());
+        add("Downloads", d.download_dir());
+        add("Pictures", d.picture_dir());
+        add("Videos", d.video_dir());
+        add("Music", d.audio_dir());
+    }
+    #[cfg(windows)]
+    for letter in b'C'..=b'Z' {
+        let root = format!("{}:\\", letter as char);
+        add(&format!("Drive {}:", letter as char), Some(Path::new(&root)));
+    }
+    #[cfg(not(windows))]
+    add("Computer", Some(Path::new("/")));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +442,33 @@ mod tests {
         assert_eq!(safe_name("CON.txt"), "_CON.txt");
         assert_eq!(safe_name("com1"), "_com1");
         assert_eq!(safe_name("notes. "), "notes");
+    }
+
+    #[test]
+    fn fetched_names_stay_in_their_folder() {
+        let root = if cfg!(windows) { r"C:\Users\me" } else { "/home/me" };
+        assert_eq!(resolve(root, Some("a.txt")).unwrap(), Path::new(root).join("a.txt"));
+        assert_eq!(resolve(root, None).unwrap(), Path::new(root));
+        for bad in ["..", ".", "", "x/y", r"x\y"] {
+            assert!(resolve(root, Some(bad)).is_err(), "{bad:?}");
+        }
+        assert!(resolve("relative/dir", None).is_err());
+        assert!(resolve("", None).unwrap().is_absolute());
+    }
+
+    #[test]
+    fn listings_put_folders_first() {
+        let dir = std::env::temp_dir().join(format!("tb-list-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("zeta")).unwrap();
+        std::fs::write(dir.join("Alpha.txt"), b"abc").unwrap();
+        std::fs::write(dir.join(".hidden"), b"").unwrap();
+        let l = list_dir(&dir.display().to_string(), None).unwrap();
+        let names: Vec<_> = l.entries.iter().map(|e| (e.name.as_str(), e.dir, e.hidden, e.size)).collect();
+        assert_eq!(names, [("zeta", true, false, 0), (".hidden", false, true, 0), ("Alpha.txt", false, false, 3)]);
+        assert_eq!(l.parent.as_deref(), dir.parent().map(|p| p.display().to_string()).as_deref());
+        let sub = list_dir(&dir.display().to_string(), Some("zeta")).unwrap();
+        assert!(sub.entries.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

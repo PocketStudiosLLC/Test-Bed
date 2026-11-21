@@ -97,6 +97,21 @@ final class Remote {
 
     static native void releaseAll(long h);
 
+    /** Streams the PC's monitor {@code name} (from the {@code connected} event's list). */
+    static native void monitor(long h, String name);
+
+    /** Drops the connection and dials again now; the PC starts input afresh. */
+    static native void reconnect(long h);
+
+    /** Sends the file at {@code path} to the PC's Downloads ({@code file_*} events follow). */
+    static native void sendFile(long h, String path);
+
+    /** Lists the PC's folder {@code dir} (home if empty), or its subfolder {@code name} (may be null). */
+    static native void listFiles(long h, long id, String dir, String name);
+
+    /** Copies the PC's file {@code name} in {@code dir} into the phone's folder {@code dest}. */
+    static native void takeFile(long h, String dir, String name, String dest);
+
     /** Puts {@code text} on the PC's clipboard. */
     static native void setClipboard(long h, String text);
 

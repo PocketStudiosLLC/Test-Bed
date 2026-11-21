@@ -31,6 +31,28 @@ pub struct KnownHost {
     /// Reached over the internet (from `internet_hosts.toml`).
     #[serde(skip)]
     pub internet: bool,
+    /// A LAN host that also lets this client in over the internet (linked
+    /// while connected on the LAN): used when the LAN can't reach it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<InternetLink>,
+}
+
+/// How to reach a LAN host over the internet.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct InternetLink {
+    /// The host's iroh endpoint id.
+    pub id: String,
+    /// Its relay URL when linked (empty: look it up).
+    #[serde(default)]
+    pub relay: String,
+}
+
+impl KnownHost {
+    /// The same host as an internet one, if it is linked.
+    pub fn over_internet(&self) -> Option<KnownHost> {
+        let l = self.link.as_ref()?;
+        Some(KnownHost { address: l.relay.clone(), fingerprint: l.id.clone(), internet: true, link: None, ..self.clone() })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -133,5 +155,31 @@ impl KnownHosts {
         if let Some(h) = self.hosts.iter_mut().find(|h| h.fingerprint == fingerprint) {
             h.last_seen = Some(crate::unix_now());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_survive_saving_and_old_files_load() {
+        let h = KnownHost {
+            name: "desk".into(),
+            address: "192.168.1.5:9876".into(),
+            fingerprint: "ab".repeat(32),
+            paired_at: 1,
+            last_seen: Some(2),
+            internet: false,
+            link: Some(InternetLink { id: "cd".repeat(32), relay: "https://relay.example/".into() }),
+        };
+        let kh = KnownHosts { hosts: vec![h.clone()], internet: false };
+        let back: KnownHosts = toml::from_str(&toml::to_string_pretty(&kh).unwrap()).unwrap();
+        assert_eq!(back.hosts, vec![h.clone()]);
+        let away = h.over_internet().unwrap();
+        assert!(away.internet && away.link.is_none());
+        assert_eq!((away.fingerprint.as_str(), away.address.as_str()), (&*"cd".repeat(32), "https://relay.example/"));
+        let old: KnownHosts = toml::from_str("[[host]]\nname = \"a\"\naddress = \"x:1\"\nfingerprint = \"f\"\npaired_at = 0\n").unwrap();
+        assert!(old.hosts[0].link.is_none() && old.hosts[0].over_internet().is_none());
     }
 }

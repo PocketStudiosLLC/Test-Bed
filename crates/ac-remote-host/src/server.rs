@@ -11,6 +11,8 @@ use ac_remote::config::{ClientConfig, HostConfig};
 use ac_remote::identity::{Identity, Role};
 use ac_remote::net::{self, Conn};
 use ac_remote::pairing::{self, HostPairOutcome, PairingWindow};
+use ac_remote::files::Served;
+use ac_remote::proto::{FileHead, LinkReply, LinkRequest};
 use ac_remote::proto::{read_msg, write_msg, write_msg_extra, ClientMsg, ClipMsg, HostExtras, HostMsg, Motion};
 use ac_remote::transport::{self, ALPN_PAIR, ALPN_PROBE, ALPN_SESSION};
 use ac_remote::trust::{AuthorizedClient, AuthorizedClients, KnownHost, KnownHosts};
@@ -349,6 +351,39 @@ impl Host {
         Ok(())
     }
 
+    /// A viewer in session on the LAN asks to be let in over the internet
+    /// too. Its LAN pairing vouches for it; this PC must allow access from
+    /// other networks.
+    async fn answer_link(&self, conn: &Conn, mut send: ac_remote::net::SendStream, req: LinkRequest) -> Result<()> {
+        let name = self.session.lock().unwrap().as_ref().filter(|s| s.conn.peer_key().ok() == conn.peer_key().ok()).map(|s| s.name.clone());
+        let ep = self.internet.lock().unwrap().clone();
+        let reply = match (conn, name, ep) {
+            (Conn::Internet(_), ..) => LinkReply::Refused { text: "already connected over the internet".into() },
+            (_, None, _) => LinkReply::Refused { text: "no session".into() },
+            (_, _, None) => LinkReply::Refused {
+                text: format!("to reach {} away from this network, turn on Allow access from other networks there (Test Bed › PC)", self.name),
+            },
+            (_, Some(name), Some(ep)) => match req.client_id.parse::<iroh::EndpointId>() {
+                Err(e) => LinkReply::Refused { text: format!("invalid endpoint id: {e}") },
+                Ok(id) => {
+                    let mut store = AuthorizedClients::load_internet()?;
+                    let new = store.find_fingerprint(&id.to_string()).is_none();
+                    store.upsert(AuthorizedClient { name: name.clone(), fingerprint: id.to_string(), paired_at: ac_remote::unix_now() });
+                    store.save()?;
+                    if new {
+                        tracing::info!("{name:?} can now connect from other networks");
+                        notify(&format!("{name} can now connect to this PC from other networks"));
+                    }
+                    LinkReply::Linked { host_id: ep.id().to_string(), relay: ep.addr().relay_urls().next().map(|r| r.to_string()) }
+                }
+            },
+        };
+        write_msg(&mut send, &reply).await?;
+        send.finish();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send.stopped()).await;
+        Ok(())
+    }
+
     async fn handle_session(self: &Arc<Self>, conn: Conn, client: AuthorizedClient) -> Result<()> {
         let (mut send, mut recv) = conn.accept_bi().await?;
         let (settings, client_name) = match read_msg::<ClientMsg>(&mut recv).await? {
@@ -626,23 +661,44 @@ impl Host {
             }
         };
 
-        // Files from the client, each on a stream of its own.
+        // Files from and to the client, each on a stream of its own.
         let files = {
             let conn = conn.clone();
             let host = self.clone();
             async move {
                 loop {
-                    let (send, recv) = conn.accept_bi().await?;
+                    let (send, mut recv) = conn.accept_bi().await?;
                     let target = *host.drop_target.lock().unwrap();
+                    let (conn, host) = (conn.clone(), host.clone());
                     tokio::spawn(async move {
-                        match ac_remote::files::receive(send, recv, move |at| crate::drop_folder::folder_for(at, target)).await {
-                            Ok(path) => {
+                        let head = match ac_remote::proto::read_file_head(&mut recv).await {
+                            Ok(Some(FileHead::Link(req))) => {
+                                if let Err(e) = host.answer_link(&conn, send, req).await {
+                                    tracing::warn!("linking for the internet: {e:#}");
+                                }
+                                return;
+                            }
+                            Ok(Some(head)) => head,
+                            Ok(None) => return,
+                            Err(e) => return tracing::warn!("file stream: {e:#}"),
+                        };
+                        let name_folder = |path: &std::path::Path| {
+                            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            (name, path.parent().map(|p| p.display().to_string()).unwrap_or_default())
+                        };
+                        match ac_remote::files::serve_head(send, recv, head, move |at| crate::drop_folder::folder_for(at, target)).await {
+                            Ok(Served::Received(path)) => {
                                 tracing::info!("received {}", path.display());
-                                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                                let folder = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                                let (name, folder) = name_folder(&path);
                                 notify(&format!("Received {name} in {folder}"));
                             }
-                            Err(e) => tracing::warn!("receiving a file: {e:#}"),
+                            Ok(Served::Sent(path)) => {
+                                tracing::info!("sent {} to the viewer", path.display());
+                                let (name, folder) = name_folder(&path);
+                                notify(&format!("Sent {name} from {folder} to the remote viewer"));
+                            }
+                            Ok(Served::Listed) => {}
+                            Err(e) => tracing::warn!("file stream: {e:#}"),
                         }
                     });
                 }
@@ -764,7 +820,7 @@ impl Host {
 fn accept_switch(name: &str, fingerprint: &str, address: SocketAddr) -> Result<(String, String)> {
     anyhow::ensure!(viewer_binary().is_some(), "Test Bed isn't installed on this PC");
     let mut known = KnownHosts::load()?;
-    known.upsert(KnownHost { name: name.into(), address: address.to_string(), fingerprint: fingerprint.into(), paired_at: ac_remote::unix_now(), last_seen: None, internet: false });
+    known.upsert(KnownHost { name: name.into(), address: address.to_string(), fingerprint: fingerprint.into(), paired_at: ac_remote::unix_now(), last_seen: None, internet: false, link: None });
     known.save()?;
     let me = Identity::load_or_create(Role::Client)?;
     let my_name = ClientConfig::load().map(|c| c.device_name()).unwrap_or_else(|_| ac_remote::hostname());

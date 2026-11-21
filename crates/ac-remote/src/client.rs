@@ -36,7 +36,7 @@ pub async fn pair(address: &str, pin: &str, name: &str) -> Result<KnownHost> {
         || matches!(address.rsplit_once(':'), Some((h, p)) if !h.contains(':') && p.parse::<u16>().is_ok());
     let address = if has_port { address.to_string() } else { format!("{address}:{}", addr.port()) };
     let now = crate::unix_now();
-    let host = KnownHost { name: paired.peer_name, address, fingerprint: paired.peer_fingerprint, paired_at: now, last_seen: Some(now), internet: false };
+    let host = KnownHost { name: paired.peer_name, address, fingerprint: paired.peer_fingerprint, paired_at: now, last_seen: Some(now), internet: false, link: None };
     let mut kh = KnownHosts::load()?;
     kh.upsert(host.clone());
     kh.save()?;

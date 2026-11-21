@@ -67,6 +67,12 @@ If the keyboard or mouse stops reaching the PC, the reconnect button (↻) drops
 the connection and dials again at once: the PC lets go of every key and button
 and starts input afresh. It also cuts short a wait between retries.
 
+**Send file** copies files to the PC's Downloads folder (or drop them on its
+screen). **Receive files** goes the other way: browse the PC's folders, tick
+files, and they're copied to this PC's Downloads. The camera button saves
+what the PC's screen shows now as a PNG in Pictures/Screenshots. The PC shows a notification
+for each file taken. The PC needs a Test Bed newer than 2.5 to share its files.
+
 **Switch sides** flips control: the PC you're viewing then controls this one.
 Test Bed shares this PC if it wasn't already, the two PCs trust each other over
 the connection that's already paired (no second code), and the other PC's

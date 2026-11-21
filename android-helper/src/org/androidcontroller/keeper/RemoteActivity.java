@@ -43,6 +43,7 @@ import android.widget.Toast;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.HashSet;
@@ -51,18 +52,23 @@ import java.util.Set;
 /**
  * Viewing and using a PC that shares with Test Bed. The picture is the PC's
  * screen: tap to click, hold for a right click, drag to drag, two fingers to
- * scroll (a two-finger tap right-clicks too). Swiping up from the bottom
- * edge opens the keyboard, which types on the PC, with a row of PC keys
- * above it. The clipboard is shared both ways while it is open.
+ * scroll (a two-finger tap right-clicks too). A bar along the top, like the
+ * one on Test Bed for PCs, shows the PC's name, its monitors and how the
+ * stream is doing, and has: what a tap does, the keyboard (which types on the
+ * PC, with a row of PC keys above it), sending and receiving files, a
+ * screenshot, Task Manager (Windows), sound, reconnecting, hiding the bar,
+ * and disconnecting. The clipboard is shared both ways while it is open.
  */
 public final class RemoteActivity extends Activity {
     static final String EXTRA_FINGERPRINT = "fingerprint";
     static final String EXTRA_NAME = "name";
 
-    /** A swipe starting this close to the bottom (fraction of the height) opens the keyboard… */
-    private static final float EDGE = 0.08f;
-    /** …once it has moved up this far. */
-    private static final float SWIPE = 0.10f;
+    /** The top bar's height, in dp. */
+    private static final int TOOLBAR_DP = 48;
+    private static final int REQ_SEND = 1, REQ_STORAGE = 2;
+    /** The bar's background: the PC app's header bar, nearly opaque. */
+    private static final int BAR_BG = 0xEE000000 | (Ui.HEADER_BG & 0xFFFFFF);
+    private static final String PREFS = "remote", PREF_MUTED = "muted";
     private static final long MIN_MOVE_GAP_MS = 8;
     private static final long TWO_FINGER_TAP_MS = 300;
     private static final long BACK_AGAIN_MS = 2_000;
@@ -76,6 +82,31 @@ public final class RemoteActivity extends Activity {
     private TextView noticeView;
     private Typing typing;
     private HorizontalScrollView strip;
+    private LinearLayout bar, monitorsRow;
+    private TextView titleView, statsView, transferView;
+    private Button clickButton, keyboardButton, sendButton, receiveButton, screenshotButton, taskManagerButton,
+            soundButton, reconnectButton, showBarButton;
+    /** The bar is hidden for a bigger picture; a small button brings it back. */
+    private boolean barHidden;
+    /** Connected now (input and files go through), and the connection gave up for good. */
+    private boolean connected, fatal;
+    private String hostOs = "";
+    /** Frames since the stats were last shown (session thread), and the latest round trip. */
+    private volatile int frames;
+    private volatile double rttMs = -1;
+    private long statsAt;
+    /** Files on their way, each way, and the copies made to send them. */
+    private int sending, receiving;
+    private RemoteFiles browser;
+    private final java.util.concurrent.ExecutorService work = java.util.concurrent.Executors.newSingleThreadExecutor();
+    /** A tap right-clicks instead of left-clicking. */
+    private boolean rightTap;
+    /** The PC's monitors, numbered in reading order, and the one streamed. */
+    private final java.util.List<String> monitors = new java.util.ArrayList<>();
+    private String monitor = "";
+    private boolean imeOpen;
+    /** The session runs over the internet (to a PC paired at home). */
+    private boolean routeAway;
     private final Set<Integer> latched = new HashSet<>();
     private final java.util.Map<Integer, Button> modButtons = new java.util.HashMap<>();
     private boolean warnedChar;
@@ -158,8 +189,10 @@ public final class RemoteActivity extends Activity {
                 decoder.setSurface(null);
             }
         });
-        root.addView(video, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+        FrameLayout.LayoutParams vlp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        vlp.topMargin = dp(TOOLBAR_DP);
+        root.addView(video, vlp);
 
         statusView = new TextView(this);
         statusView.setTextColor(Color.WHITE);
@@ -173,12 +206,24 @@ public final class RemoteActivity extends Activity {
         noticeView.setTextColor(Color.WHITE);
         noticeView.setTextSize(14);
         noticeView.setPadding(dp(12), dp(6), dp(12), dp(6));
-        noticeView.setBackground(rounded(0xCC000000, dp(8)));
+        noticeView.setBackground(rounded(0xE6000000 | (Ui.WINDOW_BG & 0xFFFFFF), dp(12)));
         noticeView.setVisibility(View.GONE);
         FrameLayout.LayoutParams nlp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        nlp.topMargin = dp(12);
+        nlp.topMargin = dp(TOOLBAR_DP + 12);
         root.addView(noticeView, nlp);
+
+        bar = makeToolbar();
+        root.addView(bar, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(TOOLBAR_DP), Gravity.TOP));
+        showBarButton = Ui.circle(this, "☰", Ui.Kind.NORMAL);
+        showBarButton.setContentDescription("Show the toolbar");
+        showBarButton.setBackground(Ui.pill(0x99000000));
+        showBarButton.setVisibility(View.GONE);
+        showBarButton.setOnClickListener(v -> setBarHidden(false));
+        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(dp(44), dp(36), Gravity.TOP | Gravity.END);
+        slp.topMargin = dp(6);
+        slp.setMarginEnd(dp(6));
+        root.addView(showBarButton, slp);
 
         strip = makeStrip();
         strip.setVisibility(View.GONE);
@@ -189,7 +234,9 @@ public final class RemoteActivity extends Activity {
         clipboard = getSystemService(ClipboardManager.class);
         if (clipboard != null) clipboard.addPrimaryClipChangedListener(clipChanged);
         setStatus("Connecting to " + pcName + "…");
+        cleanTransfers();
         start();
+        main.post(stats);
     }
 
     @Override
@@ -213,7 +260,11 @@ public final class RemoteActivity extends Activity {
     @Override
     protected void onDestroy() {
         if (clipboard != null) clipboard.removePrimaryClipChangedListener(clipChanged);
+        main.removeCallbacks(stats);
+        if (browser != null) browser.dismiss();
         stop();
+        work.execute(this::cleanTransfers);
+        work.shutdown();
         super.onDestroy();
     }
 
@@ -261,6 +312,7 @@ public final class RemoteActivity extends Activity {
                                 showing = true;
                                 main.post(() -> setStatus(""));
                             }
+                            frames++;
                             decoder.frame(ev, ev[1] != 0, h);
                             break;
                         case Remote.EV_AUDIO:
@@ -306,17 +358,75 @@ public final class RemoteActivity extends Activity {
         switch (o.optString("t")) {
             case "connecting":
                 showing = false;
+                main.post(() -> setConnected(false));
                 if (o.optInt("attempt") <= 1) main.post(() -> setStatus("Connecting to " + pcName + "…"));
                 break;
             case "connected":
-                main.post(() -> setStatus("Waiting for the picture…"));
+                java.util.List<String> names = new java.util.ArrayList<>();
+                org.json.JSONArray ms = o.optJSONArray("monitors");
+                for (int i = 0; ms != null && i < ms.length(); i++) {
+                    JSONObject m = ms.optJSONObject(i);
+                    if (m != null) names.add(m.optString("name"));
+                }
+                String os = o.optString("os");
+                main.post(() -> {
+                    setStatus("Waiting for the picture…");
+                    monitors.clear();
+                    monitors.addAll(names);
+                    hostOs = os;
+                    setConnected(true);
+                    renderMonitors();
+                });
+                break;
+            case "clock":
+                rttMs = o.optDouble("rtt_ms", -1);
+                break;
+            case "file_progress":
+            case "take_progress": {
+                boolean out = o.optString("t").equals("file_progress");
+                String name = o.optString("name");
+                long done = o.optLong("done"), total = o.optLong("total");
+                main.post(() -> progress(out, name, done, total));
+                break;
+            }
+            case "file_sent":
+                main.post(() -> {
+                    sending = Math.max(0, sending - 1);
+                    renderTransfer();
+                    notice("Sent " + o.optString("name") + " to " + pcName + ": " + o.optString("path"));
+                });
+                break;
+            case "file_failed":
+                main.post(() -> {
+                    sending = Math.max(0, sending - 1);
+                    renderTransfer();
+                    notice("Couldn't send " + o.optString("name") + ": " + text);
+                });
+                break;
+            case "listing":
+                main.post(() -> {
+                    if (browser != null) browser.listing(o.optLong("id"), o);
+                });
+                break;
+            case "taken":
+                saveTaken(o.optString("name"), o.optString("path"));
+                break;
+            case "take_failed":
+                main.post(() -> {
+                    receiving = Math.max(0, receiving - 1);
+                    renderTransfer();
+                    notice("Couldn't receive " + o.optString("name") + ": " + text);
+                });
                 break;
             case "stream":
                 int w = o.optInt("width"), h = o.optInt("height");
+                String shown = o.optString("monitor");
                 decoder.size(w, h);
                 main.post(() -> {
                     videoW = w;
                     videoH = h;
+                    monitor = shown;
+                    renderMonitors();
                     fitVideo();
                 });
                 break;
@@ -326,17 +436,50 @@ public final class RemoteActivity extends Activity {
             case "clipboard":
                 main.post(() -> fromPc(text));
                 break;
+            case "route":
+                boolean away = o.optBoolean("internet");
+                main.post(() -> {
+                    if (away && !routeAway) notice("Connected to " + pcName + " over the internet");
+                    routeAway = away;
+                });
+                break;
+            case "linked":
+                if (o.optBoolean("new")) {
+                    main.post(() -> notice(pcName + " can now be reached from other networks too"));
+                }
+                break;
+            case "link_failed":
+                // Said once per PC: it is retried on every connection from home.
+                main.post(() -> {
+                    android.content.SharedPreferences p = getSharedPreferences("remote", MODE_PRIVATE);
+                    String key = "link-hint:" + fingerprint;
+                    if (p.getBoolean(key, false)) return;
+                    p.edit().putBoolean(key, true).apply();
+                    notice(text);
+                });
+                break;
             case "reconnecting":
                 showing = false;
-                main.post(() -> setStatus("Reconnecting… (" + text + ")"));
+                main.post(() -> {
+                    setConnected(false);
+                    long s = (o.optLong("retry_ms") + 999) / 1000;
+                    setStatus("Reconnecting in " + s + " s…\n" + text);
+                });
                 break;
             case "disconnected":
                 // A reconnect follows by itself.
                 showing = false;
-                main.post(() -> setStatus("Connection lost: " + text));
+                main.post(() -> {
+                    setConnected(false);
+                    setStatus("Connection lost: " + text);
+                });
                 break;
             case "fatal":
-                main.post(() -> setStatus(text.isEmpty() ? "Disconnected" : text));
+                main.post(() -> {
+                    fatal = true;
+                    setConnected(false);
+                    setStatus(text.isEmpty() ? "Disconnected" : "Can't connect\n" + text);
+                });
                 return false;
             case "closed":
                 return false;
@@ -360,17 +503,484 @@ public final class RemoteActivity extends Activity {
         main.postDelayed(hideNotice, 4_000);
     }
 
-    /** Keeps the PC screen's shape. */
+    /** Keeps the PC screen's shape, in the space below the bar. */
     private void fitVideo() {
-        int rw = root.getWidth(), rh = root.getHeight();
+        int barH = barHidden ? 0 : dp(TOOLBAR_DP);
+        int rw = root.getWidth(), rh = root.getHeight() - barH;
         if (videoW <= 0 || videoH <= 0 || rw <= 0 || rh <= 0) return;
         float scale = Math.min((float) rw / videoW, (float) rh / videoH);
         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) video.getLayoutParams();
         int w = Math.round(videoW * scale), h = Math.round(videoH * scale);
-        if (lp.width == w && lp.height == h) return;
+        int top = barH + (rh - h) / 2;
+        if (lp.width == w && lp.height == h && lp.topMargin == top && lp.bottomMargin == 0) return;
         lp.width = w;
         lp.height = h;
+        lp.topMargin = top;
+        lp.bottomMargin = 0;
         video.setLayoutParams(lp);
+    }
+
+    // ---- the bar -------------------------------------------------------------------------------
+
+    /**
+     * As on Test Bed for PCs: the PC's name, its monitors and the stream's
+     * numbers, then the actions; Disconnect stays at the end. The actions
+     * scroll sideways when the phone is too narrow for all of them.
+     */
+    private LinearLayout makeToolbar() {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setPadding(dp(10), 0, dp(6), 0);
+        bar.setBackgroundColor(BAR_BG);
+        // Touches between the buttons don't reach the PC.
+        bar.setClickable(true);
+
+        titleView = new TextView(this);
+        titleView.setText(pcName);
+        titleView.setTextColor(Color.WHITE);
+        titleView.setTextSize(14);
+        titleView.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        titleView.setSingleLine(true);
+        titleView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        titleView.setMaxWidth(dp(160));
+        bar.addView(titleView);
+
+        monitorsRow = new LinearLayout(this);
+        monitorsRow.setGravity(Gravity.CENTER_VERTICAL);
+        monitorsRow.setPadding(dp(8), 0, 0, 0);
+        bar.addView(monitorsRow);
+
+        statsView = new TextView(this);
+        statsView.setTextColor(Ui.DIM);
+        statsView.setTextSize(12);
+        statsView.setSingleLine(true);
+        statsView.setPadding(dp(8), 0, dp(8), 0);
+        statsView.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        bar.addView(statsView, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setGravity(Gravity.CENTER_VERTICAL);
+
+        transferView = new TextView(this);
+        transferView.setTextColor(Ui.DIM);
+        transferView.setTextSize(12);
+        transferView.setSingleLine(true);
+        transferView.setPadding(0, 0, dp(8), 0);
+        transferView.setVisibility(View.GONE);
+        actions.addView(transferView);
+
+        clickButton = stripButton("");
+        clickButton.setOnClickListener(v -> {
+            rightTap = !rightTap;
+            renderClick();
+            notice(rightTap ? "A tap is now a right click" : "A tap is now a left click");
+        });
+        actions.addView(clickButton, stripParams());
+        renderClick();
+
+        keyboardButton = stripButton("⌨ Keyboard");
+        keyboardButton.setOnClickListener(v -> {
+            if (imeOpen) typing.hide();
+            else typing.show();
+        });
+        actions.addView(keyboardButton, stripParams());
+
+        sendButton = action(actions, "Send file", "Send files from this phone to the Downloads folder on " + pcName,
+                this::chooseFiles);
+        receiveButton = action(actions, "Receive files", "Copy files from " + pcName + " to this phone's Downloads",
+                this::browseFiles);
+        screenshotButton = action(actions, "Screenshot", "Save a screenshot of " + pcName + " to Pictures/Screenshots",
+                this::screenshot);
+        taskManagerButton = action(actions, "Task Manager", "Open Task Manager on " + pcName + " (Ctrl+Shift+Esc)",
+                this::openTaskManager);
+        taskManagerButton.setVisibility(View.GONE);
+
+        soundButton = stripButton("");
+        soundButton.setOnClickListener(v -> {
+            boolean m = !audio.muted;
+            audio.muted = m;
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_MUTED, m).apply();
+            renderSound();
+        });
+        audio.muted = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_MUTED, false);
+        actions.addView(soundButton, stripParams());
+        renderSound();
+
+        reconnectButton = stripButton("Reconnect");
+        reconnectButton.setContentDescription("Reconnect, if the keyboard or mouse stopped working");
+        reconnectButton.setOnClickListener(v -> reconnect());
+        actions.addView(reconnectButton, stripParams());
+
+        Button hide = stripButton("Hide bar");
+        hide.setContentDescription("Hide this bar for a bigger picture");
+        hide.setOnClickListener(v -> setBarHidden(true));
+        actions.addView(hide, stripParams());
+
+        HorizontalScrollView scroller = new HorizontalScrollView(this);
+        scroller.setHorizontalScrollBarEnabled(false);
+        scroller.addView(actions);
+        bar.addView(scroller, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        Button disconnect = Ui.circle(this, "✕", Ui.Kind.FLAT);
+        disconnect.setContentDescription("Disconnect");
+        disconnect.setOnClickListener(v -> finish());
+        LinearLayout.LayoutParams dlp = stripParams();
+        dlp.setMarginStart(dp(4));
+        dlp.setMarginEnd(0);
+        bar.addView(disconnect, dlp);
+
+        renderMonitors();
+        setConnected(false);
+        return bar;
+    }
+
+    private Button action(LinearLayout row, String label, String description, Runnable onClick) {
+        Button b = stripButton(label);
+        b.setContentDescription(description);
+        b.setOnClickListener(v -> onClick.run());
+        b.setOnLongClickListener(v -> {
+            notice(description);
+            return true;
+        });
+        row.addView(b, stripParams());
+        return b;
+    }
+
+    private void renderClick() {
+        clickButton.setText(rightTap ? "Tap: Right click" : "Tap: Left click");
+        Ui.style(clickButton, rightTap ? Ui.Kind.CHECKED : Ui.Kind.NORMAL);
+    }
+
+    private void renderSound() {
+        boolean m = audio.muted;
+        soundButton.setText(m ? "Sound: Off" : "Sound: On");
+        soundButton.setContentDescription(m ? "Sound muted: tap to hear " + pcName : "Mute " + pcName + "'s sound");
+        Ui.style(soundButton, m ? Ui.Kind.NORMAL : Ui.Kind.CHECKED);
+    }
+
+    /** Buttons that need the PC follow the connection. */
+    private void setConnected(boolean on) {
+        connected = on;
+        for (Button b : new Button[] {sendButton, receiveButton, screenshotButton, taskManagerButton}) {
+            if (b == null) continue;
+            b.setEnabled(on);
+        }
+        if (taskManagerButton != null) taskManagerButton.setVisibility("windows".equals(hostOs) ? View.VISIBLE : View.GONE);
+        if (reconnectButton != null) {
+            reconnectButton.setEnabled(!fatal);
+        }
+        if (!on) {
+            transfersLost();
+            if (browser != null) browser.dismiss();
+        }
+    }
+
+    private void setBarHidden(boolean hidden) {
+        barHidden = hidden;
+        bar.setVisibility(hidden ? View.GONE : View.VISIBLE);
+        showBarButton.setVisibility(hidden ? View.VISIBLE : View.GONE);
+        FrameLayout.LayoutParams nlp = (FrameLayout.LayoutParams) noticeView.getLayoutParams();
+        nlp.topMargin = dp((hidden ? 0 : TOOLBAR_DP) + 12);
+        noticeView.setLayoutParams(nlp);
+        fitVideo();
+        if (hidden) notice("Tap ☰ at the top right to show the bar again");
+    }
+
+    /** "12 ms · 60 fps · 1920×1080", once a second, as on the PC. */
+    private final Runnable stats = new Runnable() {
+        @Override
+        public void run() {
+            long now = android.os.SystemClock.elapsedRealtime();
+            long dt = statsAt == 0 ? 0 : now - statsAt;
+            int n = frames;
+            frames = 0;
+            statsAt = now;
+            if (connected && showing && dt > 0) {
+                double rtt = rttMs;
+                String lat = rtt >= 0 ? Math.round(rtt) + " ms" : "– ms";
+                statsView.setText(lat + " · " + Math.round(n * 1000.0 / dt) + " fps · " + videoW + "×" + videoH);
+            } else {
+                statsView.setText("");
+            }
+            main.postDelayed(this, 1_000);
+        }
+    };
+
+    /** One button per monitor when there are several; the streamed one stands out. */
+    private void renderMonitors() {
+        if (monitorsRow == null) return;
+        monitorsRow.removeAllViews();
+        if (monitors.size() < 2) return;
+        for (int i = 0; i < monitors.size(); i++) {
+            String name = monitors.get(i);
+            int number = i + 1;
+            Button b = stripButton(String.valueOf(number));
+            b.setContentDescription("Monitor " + number + ": " + name);
+            Ui.style(b, name.equals(monitor) ? Ui.Kind.SUGGESTED : Ui.Kind.NORMAL);
+            b.setOnClickListener(v -> switchMonitor(name));
+            b.setOnLongClickListener(v -> {
+                notice("Monitor " + number + ": " + name);
+                return true;
+            });
+            monitorsRow.addView(b, stripParams());
+        }
+    }
+
+    private void switchMonitor(String name) {
+        long h = session;
+        if (h == 0 || name.equals(monitor)) return;
+        notice("Switching to " + name + "…");
+        Remote.monitor(h, name);
+    }
+
+    /** Ctrl+Shift+Esc on the PC, which opens Windows' Task Manager. */
+    private void openTaskManager() {
+        long h = session;
+        if (h == 0 || !connected) return;
+        // Keys latched here would turn the chord into something else.
+        Remote.releaseAll(h);
+        clearLatched();
+        int[] chord = {PcKeys.LEFTCTRL, PcKeys.LEFTSHIFT, PcKeys.ESC};
+        for (int code : chord) Remote.key(h, code, true);
+        for (int i = chord.length - 1; i >= 0; i--) Remote.key(h, chord[i], false);
+    }
+
+    /**
+     * Drops the connection and dials again at once, also cutting short a wait
+     * between retries. The PC lets go of every key and button and starts
+     * input afresh: the fix for a keyboard or mouse that stopped.
+     */
+    private void reconnect() {
+        long h = session;
+        if (h == 0 || fatal) return;
+        if (connected) Remote.releaseAll(h);
+        clearLatched();
+        showing = false;
+        setConnected(false);
+        setStatus("Reconnecting to " + pcName + "…");
+        Remote.reconnect(h);
+    }
+
+    private void clearLatched() {
+        if (latched.isEmpty()) return;
+        latched.clear();
+        renderMods();
+    }
+
+    // ---- files and screenshots -----------------------------------------------------------------
+
+    private File sendDir() {
+        return new File(getCacheDir(), "remote-send");
+    }
+
+    private File takeDir() {
+        return new File(getCacheDir(), "remote-take");
+    }
+
+    /** Copies left from an earlier visit. */
+    private void cleanTransfers() {
+        Saved.delete(sendDir());
+        Saved.delete(takeDir());
+    }
+
+    private void chooseFiles() {
+        if (!connected) return;
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
+                .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        try {
+            startActivityForResult(i, REQ_SEND);
+        } catch (android.content.ActivityNotFoundException e) {
+            notice("This phone has no file picker");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != REQ_SEND || result != RESULT_OK || data == null) return;
+        java.util.List<android.net.Uri> uris = new java.util.ArrayList<>();
+        if (data.getClipData() != null) {
+            for (int i = 0; i < data.getClipData().getItemCount(); i++) uris.add(data.getClipData().getItemAt(i).getUri());
+        } else if (data.getData() != null) {
+            uris.add(data.getData());
+        }
+        if (uris.isEmpty()) return;
+        sending += uris.size();
+        renderTransfer();
+        // Test Bed sends files from a path: copy each into this app's cache first.
+        work.execute(() -> {
+            for (android.net.Uri u : uris) {
+                String name = displayName(u);
+                try {
+                    File dir = new File(sendDir(), Long.toString(System.nanoTime()));
+                    if (!dir.mkdirs()) throw new java.io.IOException("can't make " + dir);
+                    File f = new File(dir, name);
+                    try (java.io.InputStream in = getContentResolver().openInputStream(u);
+                            java.io.OutputStream out = new java.io.FileOutputStream(f)) {
+                        if (in == null) throw new java.io.IOException("can't open it");
+                        Saved.copy(in, out);
+                    }
+                    long h = session;
+                    if (h == 0) throw new java.io.IOException("not connected");
+                    Remote.sendFile(h, f.getAbsolutePath());
+                } catch (java.io.IOException | RuntimeException e) {
+                    main.post(() -> {
+                        sending = Math.max(0, sending - 1);
+                        renderTransfer();
+                        notice("Couldn't send " + name + ": " + e.getMessage());
+                    });
+                }
+            }
+        });
+    }
+
+    private String displayName(android.net.Uri u) {
+        try (android.database.Cursor c = getContentResolver().query(u,
+                new String[] {android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst() && c.getString(0) != null) return Saved.safeName(c.getString(0));
+        } catch (RuntimeException ignored) {
+            // fall back to the path's last part
+        }
+        return Saved.safeName(u.getLastPathSegment());
+    }
+
+    /** Receive files: browse the PC's folders and copy files from it. */
+    private void browseFiles() {
+        if (!connected || browser != null) return;
+        askStorage();
+        // Keys latched now would apply to whatever is typed after the dialog.
+        clearLatched();
+        browser = new RemoteFiles(this, pcName, new RemoteFiles.Ask() {
+            @Override
+            public void list(long id, String dir, String name) {
+                long h = session;
+                if (h != 0) Remote.listFiles(h, id, dir, name);
+            }
+
+            @Override
+            public void take(String dir, java.util.List<String> names) {
+                takeFiles(dir, names);
+            }
+
+            @Override
+            public void closed() {
+                browser = null;
+                hideSystemBars();
+            }
+        });
+    }
+
+    private void takeFiles(String dir, java.util.List<String> names) {
+        long h = session;
+        if (h == 0 || !connected) {
+            notice("Connect to " + pcName + " to receive files");
+            return;
+        }
+        File dest = takeDir();
+        if (!dest.isDirectory() && !dest.mkdirs()) {
+            notice("Couldn't make room for the files on this phone");
+            return;
+        }
+        for (String name : names) {
+            receiving++;
+            Remote.takeFile(h, dir, name, dest.getAbsolutePath());
+        }
+        renderTransfer();
+    }
+
+    /** A file from the PC landed in the cache: into Downloads with it (session thread). */
+    private void saveTaken(String name, String path) {
+        work.execute(() -> {
+            File f = new File(path);
+            String msg;
+            try {
+                msg = "Received " + name + " from " + pcName + ": " + Saved.download(this, f, name);
+            } catch (java.io.IOException | RuntimeException e) {
+                msg = "Couldn't save " + name + ": " + e.getMessage();
+            } finally {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            }
+            String m = msg;
+            main.post(() -> {
+                receiving = Math.max(0, receiving - 1);
+                renderTransfer();
+                notice(m);
+            });
+        });
+    }
+
+    private void progress(boolean out, String name, long done, long total) {
+        long pct = total > 0 ? done * 100 / total : 100;
+        int waiting = (out ? sending : receiving) - 1;
+        String more = waiting > 0 ? " (+" + waiting + ")" : "";
+        transferView.setText((out ? "Sending " : "Receiving ") + name + " · " + pct + "%" + more);
+        transferView.setVisibility(View.VISIBLE);
+    }
+
+    private void renderTransfer() {
+        if (sending + receiving == 0) {
+            transferView.setVisibility(View.GONE);
+        } else if (transferView.getVisibility() != View.VISIBLE) {
+            transferView.setText(sending > 0 ? "Sending…" : "Receiving…");
+            transferView.setVisibility(View.VISIBLE);
+        }
+    }
+
+    /** The connection dropped: files still queued won't go either way. */
+    private void transfersLost() {
+        int lost = sending + receiving;
+        if (lost == 0) return;
+        sending = receiving = 0;
+        renderTransfer();
+        notice((lost == 1 ? "A file transfer" : lost + " file transfers") + " stopped: the connection to " + pcName
+                + " dropped");
+    }
+
+    /** Saves the picture shown now as a PNG in Pictures/Screenshots. */
+    private void screenshot() {
+        if (!connected || !showing || videoW <= 0 || videoH <= 0) {
+            notice("No picture from " + pcName + " yet");
+            return;
+        }
+        askStorage();
+        android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(videoW, videoH, android.graphics.Bitmap.Config.ARGB_8888);
+        try {
+            android.view.PixelCopy.request(video, bmp, r -> {
+                if (r != android.view.PixelCopy.SUCCESS) {
+                    bmp.recycle();
+                    notice("Couldn't take the screenshot");
+                    return;
+                }
+                String when = new java.text.SimpleDateFormat("yyyy-MM-dd HH-mm-ss", java.util.Locale.ROOT).format(new java.util.Date());
+                String name = Saved.safeName(pcName + " " + when + ".png");
+                work.execute(() -> {
+                    String msg;
+                    try {
+                        java.io.ByteArrayOutputStream png = new java.io.ByteArrayOutputStream();
+                        bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, png);
+                        msg = "Screenshot of " + pcName + " saved: " + Saved.screenshot(this, png.toByteArray(), name);
+                    } catch (java.io.IOException | RuntimeException e) {
+                        msg = "Couldn't save the screenshot: " + e.getMessage();
+                    } finally {
+                        bmp.recycle();
+                    }
+                    String m = msg;
+                    main.post(() -> notice(m));
+                });
+            }, main);
+        } catch (IllegalArgumentException e) {
+            bmp.recycle();
+            notice("Couldn't take the screenshot: " + e.getMessage());
+        }
+    }
+
+    /** Android 6–9 only lets the app write Downloads and Pictures once allowed. */
+    private void askStorage() {
+        if (Saved.needsPermission(this)) {
+            requestPermissions(new String[] {android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_STORAGE);
+        }
     }
 
     // ---- touch: the PC's mouse ---------------------------------------------------------------
@@ -378,14 +988,13 @@ public final class RemoteActivity extends Activity {
     private enum Mode { NONE, PENDING, DRAG, SCROLL, DONE }
 
     private Mode mode = Mode.NONE;
-    private boolean fromEdge;
     private float downX, downY, lastAvgX, lastAvgY;
     private float scrollRemX, scrollRemY;
     private long twoFingersAt;
     private boolean scrolled;
     private long lastMoveSent;
     private final Runnable longPress = () -> {
-        if (mode == Mode.PENDING && !fromEdge) {
+        if (mode == Mode.PENDING) {
             mode = Mode.DONE;
             click(PcKeys.BTN_RIGHT);
         }
@@ -395,14 +1004,12 @@ public final class RemoteActivity extends Activity {
     public boolean onTouchEvent(MotionEvent e) {
         long h = session;
         int slop = ViewConfiguration.get(this).getScaledTouchSlop();
-        int height = root.getHeight();
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 downX = e.getX();
                 downY = e.getY();
-                fromEdge = downY > height * (1 - EDGE);
                 mode = Mode.PENDING;
-                if (!fromEdge) moveTo(e.getX(), e.getY());
+                moveTo(e.getX(), e.getY());
                 main.postDelayed(longPress, ViewConfiguration.getLongPressTimeout());
                 break;
             case MotionEvent.ACTION_POINTER_DOWN:
@@ -419,14 +1026,6 @@ public final class RemoteActivity extends Activity {
                 break;
             case MotionEvent.ACTION_MOVE:
                 if (mode == Mode.PENDING) {
-                    if (fromEdge) {
-                        if (downY - e.getY() > height * SWIPE) {
-                            main.removeCallbacks(longPress);
-                            mode = Mode.DONE;
-                            typing.show();
-                        }
-                        break;
-                    }
                     if (Math.hypot(e.getX() - downX, e.getY() - downY) > slop) {
                         main.removeCallbacks(longPress);
                         mode = Mode.DRAG;
@@ -452,9 +1051,7 @@ public final class RemoteActivity extends Activity {
             case MotionEvent.ACTION_UP:
                 main.removeCallbacks(longPress);
                 if (mode == Mode.PENDING) {
-                    // A tap; one near the edge is a click there after all.
-                    if (fromEdge) moveTo(e.getX(), e.getY());
-                    click(PcKeys.BTN_LEFT);
+                    click(rightTap ? PcKeys.BTN_RIGHT : PcKeys.BTN_LEFT);
                 } else if (mode == Mode.DRAG) {
                     moveTo(e.getX(), e.getY());
                     if (h != 0) Remote.button(h, PcKeys.BTN_LEFT, false);
@@ -604,12 +1201,12 @@ public final class RemoteActivity extends Activity {
     private HorizontalScrollView makeStrip() {
         LinearLayout row = new LinearLayout(this);
         row.setPadding(dp(4), dp(2), dp(4), dp(2));
-        row.setBackgroundColor(0xEE202020);
+        row.setBackgroundColor(BAR_BG);
         for (Object[] k : new Object[][] {{"Copy", (Runnable) () -> ctrl(PcKeys.KEY_C)}, {"Paste", (Runnable) this::paste}}) {
             Button b = stripButton((String) k[0]);
             Runnable r = (Runnable) k[1];
             b.setOnClickListener(v -> r.run());
-            b.setBackground(rounded(0xFF1565C0, dp(6)));
+            Ui.style(b, Ui.Kind.SUGGESTED);
             row.addView(b, stripParams());
         }
         Object[][] keys = {
@@ -641,18 +1238,11 @@ public final class RemoteActivity extends Activity {
         return s;
     }
 
+    /** A round button, as on the PC, sized for the bar. */
     private Button stripButton(String label) {
-        Button b = new Button(this);
-        b.setText(label);
-        b.setAllCaps(false);
-        b.setTextColor(Color.WHITE);
+        Button b = Ui.button(this, label, Ui.Kind.NORMAL);
         b.setTextSize(13);
-        b.setMinWidth(0);
-        b.setMinimumWidth(dp(44));
-        b.setMinHeight(0);
-        b.setMinimumHeight(dp(36));
-        b.setPadding(dp(8), 0, dp(8), 0);
-        b.setBackground(rounded(0xFF3A3A3A, dp(6)));
+        b.setPadding(dp(12), 0, dp(12), 0);
         return b;
     }
 
@@ -664,7 +1254,7 @@ public final class RemoteActivity extends Activity {
 
     private void renderMods() {
         for (java.util.Map.Entry<Integer, Button> e : modButtons.entrySet()) {
-            e.getValue().setBackground(rounded(latched.contains(e.getKey()) ? 0xFF2E7D32 : 0xFF3A3A3A, dp(6)));
+            Ui.style(e.getValue(), latched.contains(e.getKey()) ? Ui.Kind.CHECKED : Ui.Kind.NORMAL);
         }
     }
 
@@ -672,6 +1262,10 @@ public final class RemoteActivity extends Activity {
     private void placeStrip() {
         int ime = imeHeight;
         boolean open = ime > dp(120);
+        if (open != imeOpen) {
+            imeOpen = open;
+            if (keyboardButton != null) Ui.style(keyboardButton, open ? Ui.Kind.CHECKED : Ui.Kind.NORMAL);
+        }
         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) strip.getLayoutParams();
         int margin = open ? ime : 0;
         if (open != (strip.getVisibility() == View.VISIBLE) || lp.bottomMargin != margin) {
@@ -702,6 +1296,11 @@ public final class RemoteActivity extends Activity {
                 imm.restartInput(this);
                 if (!imm.showSoftInput(this, 0)) imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0);
             });
+        }
+
+        void hide() {
+            InputMethodManager imm = getContext().getSystemService(InputMethodManager.class);
+            if (imm != null) imm.hideSoftInputFromWindow(getWindowToken(), 0);
         }
 
         RemoteActivity activity() {
@@ -933,9 +1532,11 @@ public final class RemoteActivity extends Activity {
         private AudioTrack track;
         private Thread drain;
         private boolean failed;
+        /** Packets are skipped while muted, so nothing plays. */
+        volatile boolean muted;
 
         void packet(byte[] ev) {
-            if (failed) return;
+            if (failed || muted) return;
             if (codec == null && !open()) return;
             try {
                 int i = codec.dequeueInputBuffer(0);

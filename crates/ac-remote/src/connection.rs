@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use crate::identity::Identity;
 use crate::net::Conn;
-use crate::proto::{read_msg, read_msg_extra, write_msg, ClientMsg, ClipMsg, HostExtras, HostMsg, MonitorInfo, Motion, StreamSettings};
+use crate::proto::{read_msg, read_msg_extra, write_msg, ClientMsg, ClipMsg, HostExtras, HostMsg, Listing, MonitorInfo, Motion, StreamSettings};
 use crate::transport::{self, ALPN_SESSION};
 use crate::trust::{KnownHost, KnownHosts};
 use crate::video::{FrameMeta, Reassembler};
@@ -51,8 +51,21 @@ pub enum NetEvent {
     /// The host saved it at `path` (a path on the host).
     FileSent { name: String, path: String },
     FileFailed { name: String, error: String },
+    /// The host's folder, for [`Outgoing::ListFiles`] `id`.
+    Listing { id: u64, result: Result<Listing, String> },
+    /// A file coming from the host: `got` of `total` bytes so far.
+    TakeProgress { name: String, got: u64, total: u64 },
+    /// Saved on this PC at `path`.
+    Taken { name: String, path: std::path::PathBuf },
+    TakeFailed { name: String, error: String },
     /// The host's clipboard changed (after [`Outgoing::WatchClipboard`]).
     Clipboard(String),
+    /// After [`Outgoing::LinkInternet`]: the host now lets this viewer in
+    /// from other networks, or why not.
+    /// `Ok(true)` the first time.
+    InternetLinked(Result<bool, String>),
+    /// The session runs over the internet (`true`) or the LAN.
+    Route { internet: bool },
     /// Unrecoverable: the viewer should show it and stop.
     Fatal(String),
 }
@@ -63,11 +76,19 @@ pub enum Outgoing {
     Motion(Motion),
     /// Send a file; `drop_at` is where on the stream it was dropped (0..1).
     SendFile { path: std::path::PathBuf, drop_at: Option<(f32, f32)> },
+    /// List the host's folder `dir` (its home if empty), or its subfolder
+    /// `name`: answered by [`NetEvent::Listing`] with the same `id`.
+    ListFiles { id: u64, dir: String, name: Option<String> },
+    /// Copy the host's file `name` in `dir` into `dest` on this PC.
+    TakeFile { dir: String, name: String, dest: std::path::PathBuf },
     /// Put this text on the host's clipboard.
     Clipboard(String),
     /// Hear about the host's clipboard ([`NetEvent::Clipboard`]), from now on
     /// and after reconnecting.
     WatchClipboard,
+    /// A LAN host: ask it, once a LAN session is up, to let this viewer in
+    /// over the internet too, so it can be reached away from this network.
+    LinkInternet,
     /// Drop the session and dial again now (skipping any backoff wait): the
     /// host starts input afresh. A request older than the current session is
     /// ignored, so one sent while dialing doesn't end the session it waited for.
@@ -90,6 +111,8 @@ pub struct NetHandle {
 struct Clip {
     watch: bool,
     pending: Option<String>,
+    /// [`Outgoing::LinkInternet`] waiting for a LAN session.
+    link: bool,
 }
 
 enum Ended {
@@ -166,10 +189,13 @@ async fn run(
                     Some(Outgoing::Reconnect(_)) => break,
                     Some(Outgoing::Msg(ClientMsg::UpdateSettings(s))) => settings = s,
                     Some(Outgoing::WatchClipboard) => clip.watch = true,
+                    Some(Outgoing::LinkInternet) => clip.link = true,
                     Some(Outgoing::Clipboard(text)) => clip.pending = Some(text),
                     Some(Outgoing::SendFile { path, .. }) => {
                         events(NetEvent::FileFailed { name: file_name(&path), error: "not connected".into() });
                     }
+                    Some(Outgoing::ListFiles { id, .. }) => events(NetEvent::Listing { id, result: Err("not connected".into()) }),
+                    Some(Outgoing::TakeFile { name, .. }) => events(NetEvent::TakeFailed { name, error: "not connected".into() }),
                     Some(_) => {}
                 }
             }
@@ -179,25 +205,30 @@ async fn run(
 }
 
 /// Where sessions are dialed from: quinn for a LAN host, iroh for one paired
-/// over the internet.
+/// over the internet. A LAN host linked for the internet is tried there too
+/// when the LAN can't reach it (away from home); `away` remembers which
+/// worked last, so a reconnect tries that first.
 enum Dialer {
-    Lan(quinn::Endpoint),
+    Lan(quinn::Endpoint, AtomicBool),
     Internet(iroh::Endpoint),
+}
+
+fn client_relay() -> String {
+    crate::config::ClientConfig::load().map(|c| c.relay).unwrap_or_default()
 }
 
 impl Dialer {
     async fn new(host: &KnownHost) -> Result<Self> {
         if host.internet {
-            let relay = crate::config::ClientConfig::load().map(|c| c.relay).unwrap_or_default();
-            Ok(Dialer::Internet(crate::internet::shared_client_endpoint(&relay).await?))
+            Ok(Dialer::Internet(crate::internet::shared_client_endpoint(&client_relay()).await?))
         } else {
-            Ok(Dialer::Lan(transport::client_endpoint()?))
+            Ok(Dialer::Lan(transport::client_endpoint()?, AtomicBool::new(false)))
         }
     }
 
     async fn close(&self) {
         match self {
-            Dialer::Lan(e) => {
+            Dialer::Lan(e, _) => {
                 e.close(0u32.into(), b"bye");
                 e.wait_idle().await;
             }
@@ -226,7 +257,7 @@ async fn session(
             return (if msg.contains("fingerprint") { Ended::Fatal(msg) } else { Ended::Retry(msg) }, false);
         }
     };
-    let r = run_session(&conn, settings, clip, client_name, rx, req_tx, events).await;
+    let r = run_session(&conn, host, settings, clip, client_name, rx, req_tx, events).await;
     let ended = match r {
         Ok(e) => e,
         Err(e) => classify(&conn, e),
@@ -255,11 +286,42 @@ fn classify(conn: &Conn, e: anyhow::Error) -> Ended {
 }
 
 async fn connect(endpoint: &Dialer, host: &KnownHost, identity: &Identity) -> Result<Conn> {
-    let endpoint = match endpoint {
-        Dialer::Lan(e) => e,
+    let (lan, away) = match endpoint {
+        Dialer::Lan(e, away) => (e, away),
         // The endpoint id is checked by iroh's handshake: no fingerprint to compare.
         Dialer::Internet(e) => return crate::internet::connect(e, host, ALPN_SESSION).await,
     };
+    // Linked while this viewer ran, perhaps: the saved host knows.
+    let remote = host.over_internet().or_else(|| {
+        KnownHosts::load().ok()?.hosts.into_iter().find(|h| h.fingerprint == host.fingerprint)?.over_internet()
+    });
+    let Some(remote) = remote else { return connect_lan(lan, host, identity).await };
+    let over_internet = || async {
+        let ep = crate::internet::shared_client_endpoint(&client_relay()).await?;
+        crate::internet::connect(&ep, &remote, ALPN_SESSION).await
+    };
+    let first_away = away.load(Ordering::Relaxed);
+    let first = if first_away { over_internet().await } else { connect_lan(lan, host, identity).await };
+    let e1 = match first {
+        Ok(c) => return Ok(c),
+        // Someone else at the address: never fall back past that.
+        Err(e) if format!("{e:#}").contains("fingerprint") => return Err(e),
+        Err(e) => e,
+    };
+    let second = if first_away { connect_lan(lan, host, identity).await } else { over_internet().await };
+    match second {
+        Ok(c) => {
+            away.store(!first_away, Ordering::Relaxed);
+            Ok(c)
+        }
+        Err(e2) => {
+            let (lan_e, net_e) = if first_away { (e2, e1) } else { (e1, e2) };
+            bail!("{} isn't reachable on this network ({lan_e:#}) or over the internet ({net_e:#})", host.name)
+        }
+    }
+}
+
+async fn connect_lan(endpoint: &quinn::Endpoint, host: &KnownHost, identity: &Identity) -> Result<Conn> {
     let addr = transport::resolve(&host.address)?;
     let cfg = transport::client_config(identity, ALPN_SESSION)?;
     let conn = tokio::time::timeout(Duration::from_secs(3), endpoint.connect_with(cfg, addr, "remotelinux")?)
@@ -279,8 +341,10 @@ async fn connect(endpoint: &Dialer, host: &KnownHost, identity: &Identity) -> Re
     Ok(conn.into())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     conn: &Conn,
+    host: &KnownHost,
     settings: &mut StreamSettings,
     clip: &mut Clip,
     client_name: &str,
@@ -290,7 +354,9 @@ async fn run_session(
 ) -> Result<Ended> {
     let started = Instant::now();
     let (mut send, mut recv) = conn.open_bi().await?;
-    write_msg(&mut send, &ClientMsg::Hello { version: crate::PROTOCOL_VERSION, client_name: client_name.into(), settings: settings.clone() }).await?;
+    let internet = matches!(conn, Conn::Internet(_)) && !host.internet;
+    let hello = ClientMsg::Hello { version: crate::PROTOCOL_VERSION, client_name: client_name.into(), settings: away_settings(settings, internet) };
+    write_msg(&mut send, &hello).await?;
     let welcome = read_msg_extra::<HostMsg, HostExtras>(&mut recv);
     match tokio::time::timeout(Duration::from_secs(3), welcome).await.map_err(|_| anyhow!("host did not answer"))?? {
         Some((HostMsg::Welcome { host_name, monitors, .. }, extras)) => {
@@ -307,8 +373,14 @@ async fn run_session(
         }
     }
 
+    events(NetEvent::Route { internet: matches!(conn, Conn::Internet(_)) });
     if clip.watch {
         spawn_clip(conn, ClipMsg::Subscribe);
+    }
+    if clip.link && matches!(conn, Conn::Lan(_)) {
+        // One try per viewer: a refusal (internet access off there) is said once.
+        clip.link = false;
+        spawn_link(conn, host, events);
     }
     if let Some(text) = clip.pending.take() {
         spawn_clip(conn, ClipMsg::Text { text: crate::proto::clip_text(&text) });
@@ -435,6 +507,29 @@ async fn run_session(
         }
     };
 
+    // Files from the host, one at a time, beside the ones going to it.
+    let (take_tx, mut take_rx) = mpsc::unbounded_channel::<(String, String, std::path::PathBuf)>();
+    let takes = {
+        let conn = conn.clone();
+        let events = events.clone();
+        async move {
+            while let Some((dir, name, dest)) = take_rx.recv().await {
+                let mut shown = Instant::now() - Duration::from_secs(1);
+                let progress = |got: u64, total: u64| {
+                    if got == total || shown.elapsed() >= Duration::from_millis(100) {
+                        shown = Instant::now();
+                        events(NetEvent::TakeProgress { name: name.clone(), got, total });
+                    }
+                };
+                match crate::files::take(&conn, &dir, &name, &dest, progress).await {
+                    Ok(path) => events(NetEvent::Taken { name, path }),
+                    Err(e) => events(NetEvent::TakeFailed { name, error: format!("{e:#}") }),
+                }
+            }
+            std::future::pending::<anyhow::Result<Ended>>().await
+        }
+    };
+
     // Viewer → host input, plus periodic pings.
     let input = {
         let conn = conn.clone();
@@ -459,9 +554,13 @@ async fn run_session(
                         }
                         Some(Outgoing::Reconnect(_)) => {}
                         Some(Outgoing::Msg(m)) => {
-                            if let ClientMsg::UpdateSettings(s) = &m {
-                                *settings = s.clone();
-                            }
+                            let m = match m {
+                                ClientMsg::UpdateSettings(s) => {
+                                    *settings = s.clone();
+                                    ClientMsg::UpdateSettings(away_settings(&s, internet))
+                                }
+                                m => m,
+                            };
                             write_msg(&mut send, &m).await?;
                         }
                         Some(Outgoing::Motion(m)) => {
@@ -471,7 +570,27 @@ async fn run_session(
                         Some(Outgoing::SendFile { path, drop_at }) => {
                             let _ = file_tx.send((path, drop_at));
                         }
+                        Some(Outgoing::TakeFile { dir, name, dest }) => {
+                            let _ = take_tx.send((dir, name, dest));
+                        }
+                        Some(Outgoing::ListFiles { id, dir, name }) => {
+                            // Not queued behind files: browsing stays quick.
+                            let conn = conn.clone();
+                            let events = events.clone();
+                            tokio::spawn(async move {
+                                let result = crate::files::list(&conn, &dir, name.as_deref()).await.map_err(|e| format!("{e:#}"));
+                                events(NetEvent::Listing { id, result });
+                            });
+                        }
                         Some(Outgoing::Clipboard(text)) => spawn_clip(&conn, ClipMsg::Text { text: crate::proto::clip_text(&text) }),
+                        Some(Outgoing::LinkInternet) => {
+                            if matches!(conn, Conn::Lan(_)) {
+                                spawn_link(&conn, host, events);
+                            } else {
+                                // Linked on the next LAN session.
+                                clip.link = true;
+                            }
+                        }
                         Some(Outgoing::WatchClipboard) => {
                             if !clip.watch {
                                 clip.watch = true;
@@ -489,8 +608,35 @@ async fn run_session(
         r = video => r,
         r = input => r,
         r = files => r,
+        r = takes => r,
         r = clipboard => r,
     }
+}
+
+/// Bitrate for a LAN host reached over the internet (one paired over the
+/// internet was asked for its own already).
+const AWAY_BITRATE_KBPS: u32 = 8_000;
+
+/// `s`, with the internet's bitrate when `away` and nothing else was asked.
+fn away_settings(s: &StreamSettings, away: bool) -> StreamSettings {
+    let mut s = s.clone();
+    if away && s.bitrate_kbps.is_none() {
+        s.bitrate_kbps = Some(AWAY_BITRATE_KBPS);
+    }
+    s
+}
+
+/// Asks the LAN host to let this viewer in over the internet too.
+fn spawn_link(conn: &Conn, host: &KnownHost, events: &Arc<dyn Fn(NetEvent) + Send + Sync>) {
+    let (conn, host, events) = (conn.clone(), host.clone(), events.clone());
+    tokio::spawn(async move {
+        let r = crate::internet::link(&conn, &host).await;
+        match &r {
+            Ok(_) => tracing::info!("{} can be reached over the internet too", host.name),
+            Err(e) => tracing::info!("not linked for the internet: {e:#}"),
+        }
+        events(NetEvent::InternetLinked(r.map_err(|e| format!("{e:#}"))));
+    });
 }
 
 /// Sends a clipboard message without holding up input.

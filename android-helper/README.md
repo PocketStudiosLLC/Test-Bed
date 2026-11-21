@@ -42,20 +42,43 @@ Under **Remote PCs** on the app's main screen:
   network**, and send the code to yourself. Connections go directly where
   the networks allow, otherwise through a relay; they are encrypted end to
   end either way.
-- Each PC shows whether it is online. **Connect** opens its screen; hold a
-  PC's row to forget it.
+- The list is laid out like Test Bed's PC tab: **Computers** (this network,
+  including PCs sharing here that aren't paired yet, each with **Pair**) and
+  **Computers on other networks**. Each group has a ↻ button to check again.
+  Every PC shows whether it is online and its latency, with **Connect** and
+  **Forget**.
 
 On the PC's screen:
 
 | Do this | To |
 |---|---|
-| Tap | Click |
+| Tap | Click (left, or right while **Tap: Right click** is on) |
 | Hold | Right-click |
 | Drag | Drag (hold the left button) |
 | Two fingers up or down | Scroll |
 | Two-finger tap | Right-click |
-| **Swipe up from the bottom edge** | Open the keyboard; what you type goes to the PC |
 | Back twice | Disconnect |
+
+The bar along the top works like the one in Test Bed on a PC. It shows the PC's
+name, a numbered button for each monitor when there are several (the one shown
+is blue; tap another to switch), and the latency, frame rate and size of the
+picture. Then come these buttons (swipe the row sideways if they don't all fit):
+
+- **Tap: Left click / Right click** chooses what a tap does.
+- **Keyboard** opens the phone's keyboard (tap again to close it); what you
+  type goes to the PC.
+- **Send file** sends files from the phone to the PC's Downloads folder.
+- **Receive files** browses the PC's folders: tick files and **Receive** copies
+  them to the phone's Downloads.
+- **Screenshot** saves the PC's screen to Pictures/Screenshots.
+- **Task Manager** (Windows PCs only) presses Ctrl+Shift+Esc.
+- **Sound: On / Off** mutes the PC's sound, and the phone remembers the choice.
+- **Reconnect** helps when the keyboard or mouse stops working.
+- **Hide bar** makes the picture bigger; tap ☰ at the top right to show the bar
+  again.
+- **✕** disconnects.
+
+Hold a button to see what it does.
 
 Above the keyboard is a row of PC keys: Esc, Tab, arrows, Home/End, Page
 Up/Down, Delete, and Ctrl, Alt, Shift and Win, which stay down for the next

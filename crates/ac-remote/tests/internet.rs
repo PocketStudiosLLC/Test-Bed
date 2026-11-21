@@ -133,12 +133,16 @@ async fn sends_files() {
             let (h, dest) = (h.clone(), dest.clone());
             tokio::spawn(async move {
                 let (s, r) = h.accept_bi().await.unwrap();
-                ac_remote::files::receive(s, r, move |at| {
+                match ac_remote::files::serve(s, r, move |at| {
                     assert_eq!(at, Some((0.25, 0.5)));
                     dest
                 })
                 .await
                 .unwrap()
+                {
+                    ac_remote::files::Served::Received(p) => p,
+                    other => panic!("{other:?}"),
+                }
             })
         };
         let mut last = (0, 0);
@@ -152,6 +156,65 @@ async fn sends_files() {
     // No partial files left behind.
     assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 2);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The viewer lists the host's folders and takes a file into its own
+/// folder; a missing file is refused with a reason.
+#[tokio::test]
+async fn takes_files() {
+    use ac_remote::files::Served;
+    let (_host, _client, h, c) = connect(ALPN_SESSION).await;
+    let dir = std::env::temp_dir().join(format!("tb-take-{}", std::process::id()));
+    let (src, dest) = (dir.join("src"), dir.join("dest"));
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    let data: Vec<u8> = (0..700_000u32).map(|i| (i % 241) as u8).collect();
+    std::fs::write(src.join("photo.jpg"), &data).unwrap();
+    let serving = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            let mut served = Vec::new();
+            for _ in 0..4 {
+                let (s, r) = h.accept_bi().await.unwrap();
+                served.push(ac_remote::files::serve(s, r, |_| unreachable!()).await.map_err(|e| e.to_string()));
+            }
+            served
+        })
+    };
+    let srcs = src.display().to_string();
+    let l = ac_remote::files::list(&c, &srcs, None).await.unwrap();
+    assert_eq!(l.path, srcs);
+    let names: Vec<_> = l.entries.iter().map(|e| (e.name.as_str(), e.dir, e.size)).collect();
+    assert_eq!(names, [("sub", true, 0), ("photo.jpg", false, data.len() as u64)]);
+    assert!(!l.places.is_empty());
+    assert!(ac_remote::files::list(&c, &srcs, Some("sub")).await.unwrap().entries.is_empty());
+
+    let mut last = (0, 0);
+    let got = ac_remote::files::take(&c, &srcs, "photo.jpg", &dest, |g, t| last = (g, t)).await.unwrap();
+    assert_eq!(got, dest.join("photo.jpg"));
+    assert_eq!(last, (data.len() as u64, data.len() as u64));
+    assert_eq!(std::fs::read(&got).unwrap(), data);
+
+    let err = ac_remote::files::take(&c, &srcs, "nope.txt", &dest, |_, _| {}).await.unwrap_err();
+    assert!(err.to_string().contains("can't open"), "{err}");
+    let served = serving.await.unwrap();
+    assert!(matches!(served[2], Ok(Served::Sent(ref p)) if p.ends_with("photo.jpg")), "{served:?}");
+    assert!(served[3].is_err());
+    // No partial files left behind.
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A 2.5 host reads a fetch as a file offer it can't decode and drops the
+/// stream: the viewer says to update rather than waiting.
+#[tokio::test]
+async fn older_host_cant_share_files() {
+    let (_host, _client, h, c) = connect(ALPN_SESSION).await;
+    tokio::spawn(async move {
+        let (_s, mut r) = h.accept_bi().await.unwrap();
+        assert!(ac_remote::proto::read_msg::<ac_remote::proto::FileOffer>(&mut r).await.is_err());
+    });
+    let err = ac_remote::files::list(&c, "", None).await.unwrap_err();
+    assert!(format!("{err:#}").contains("update Test Bed"), "{err:#}");
 }
 
 /// A host that never answers (an older Test Bed) fails the send instead of hanging.

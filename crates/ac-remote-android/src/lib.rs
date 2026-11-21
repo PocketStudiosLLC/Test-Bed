@@ -45,7 +45,7 @@ pub fn init(files_dir: &str) {
 }
 
 fn host_json(h: &KnownHost) -> Value {
-    json!({ "name": h.name, "fingerprint": h.fingerprint, "address": h.address, "internet": h.internet })
+    json!({ "name": h.name, "fingerprint": h.fingerprint, "address": h.address, "internet": h.internet, "linked": h.link.is_some() })
 }
 
 fn all_hosts() -> Result<Vec<KnownHost>> {
@@ -63,7 +63,8 @@ pub fn hosts() -> Result<Value> {
     Ok(Value::Array(all_hosts()?.iter().map(host_json).collect()))
 }
 
-/// Which paired PCs answer: `{fingerprint: rtt_ms or null}`.
+/// Which paired PCs answer: `{fingerprint: rtt_ms or null}`, and under
+/// `"away"` the LAN PCs that only answered over the internet.
 pub fn probe() -> Result<Value> {
     let hosts = all_hosts()?;
     let (lan, net): (Vec<_>, Vec<_>) = hosts.into_iter().partition(|h| !h.internet);
@@ -72,9 +73,23 @@ pub fn probe() -> Result<Value> {
         tokio::join!(ac_remote::client::probe(&lan, t), ac_remote::internet::probe(&net, "", Duration::from_secs(6)))
     });
     let mut out = serde_json::Map::new();
-    for (h, r) in lan.iter().zip(a).chain(net.iter().zip(b)) {
+    for (h, r) in lan.iter().zip(&a).chain(net.iter().zip(&b)) {
         out.insert(h.fingerprint.clone(), r.rtt_ms.map(Value::from).unwrap_or(Value::Null));
     }
+    // LAN PCs out of reach here but linked: maybe away from home.
+    let (lan_fps, twins): (Vec<String>, Vec<KnownHost>) =
+        lan.iter().zip(&a).filter(|(_, r)| r.rtt_ms.is_none()).filter_map(|(h, _)| Some((h.fingerprint.clone(), h.over_internet()?))).unzip();
+    let mut away = Vec::new();
+    if !twins.is_empty() {
+        let c = runtime().block_on(ac_remote::internet::probe(&twins, "", Duration::from_secs(6)));
+        for (fp, r) in lan_fps.into_iter().zip(c) {
+            if let Some(ms) = r.rtt_ms {
+                out.insert(fp.clone(), Value::from(ms));
+                away.push(Value::from(fp));
+            }
+        }
+    }
+    out.insert("away".into(), Value::Array(away));
     Ok(Value::Object(out))
 }
 
@@ -105,6 +120,8 @@ pub fn forget(fingerprint: &str) -> Result<()> {
 
 pub struct Session {
     net: NetHandle,
+    /// What the stream was asked for, so a monitor switch keeps the rest.
+    settings: Mutex<StreamSettings>,
     events: Mutex<Receiver<Vec<u8>>>,
     seq: AtomicU32,
 }
@@ -131,8 +148,16 @@ fn encode(ev: NetEvent) -> Option<Vec<u8>> {
             b
         }
         NetEvent::Connecting { attempt } => status(json!({ "t": "connecting", "attempt": attempt })),
-        NetEvent::Connected { host_name, .. } => status(json!({ "t": "connected", "host": host_name })),
-        NetEvent::Stream { width, height, .. } => status(json!({ "t": "stream", "width": width, "height": height })),
+        NetEvent::Connected { host_name, mut monitors, host_os } => {
+            // Numbered in reading order, as on the PC viewer.
+            monitors.sort_by_key(|m| (m.y, m.x));
+            let monitors: Vec<Value> =
+                monitors.iter().map(|m| json!({ "name": m.name, "width": m.width, "height": m.height })).collect();
+            status(json!({ "t": "connected", "host": host_name, "monitors": monitors, "os": host_os }))
+        }
+        NetEvent::Stream { monitor, width, height, .. } => {
+            status(json!({ "t": "stream", "monitor": monitor, "width": width, "height": height }))
+        }
         NetEvent::Notice(text) => status(json!({ "t": "notice", "text": text })),
         NetEvent::Disconnected { reason } => status(json!({ "t": "disconnected", "text": reason })),
         NetEvent::Reconnecting { retry_in, reason, .. } => {
@@ -140,7 +165,25 @@ fn encode(ev: NetEvent) -> Option<Vec<u8>> {
         }
         NetEvent::Fatal(text) => status(json!({ "t": "fatal", "text": text })),
         NetEvent::Clipboard(text) => status(json!({ "t": "clipboard", "text": text })),
-        NetEvent::SwitchRefused(text) | NetEvent::FileFailed { error: text, .. } => status(json!({ "t": "notice", "text": text })),
+        NetEvent::InternetLinked(Ok(new)) => status(json!({ "t": "linked", "new": new })),
+        NetEvent::InternetLinked(Err(text)) => status(json!({ "t": "link_failed", "text": text })),
+        NetEvent::Route { internet } => status(json!({ "t": "route", "internet": internet })),
+        NetEvent::SwitchRefused(text) => status(json!({ "t": "notice", "text": text })),
+        NetEvent::Clock { rtt_us, .. } => status(json!({ "t": "clock", "rtt_ms": rtt_us as f64 / 1000.0 })),
+        NetEvent::FileProgress { name, sent, total } => {
+            status(json!({ "t": "file_progress", "name": name, "done": sent, "total": total }))
+        }
+        NetEvent::FileSent { name, path } => status(json!({ "t": "file_sent", "name": name, "path": path })),
+        NetEvent::FileFailed { name, error } => status(json!({ "t": "file_failed", "name": name, "text": error })),
+        NetEvent::Listing { id, result } => match result {
+            Ok(l) => status(json!({ "t": "listing", "id": id, "listing": l })),
+            Err(e) => status(json!({ "t": "listing", "id": id, "error": e })),
+        },
+        NetEvent::TakeProgress { name, got, total } => {
+            status(json!({ "t": "take_progress", "name": name, "done": got, "total": total }))
+        }
+        NetEvent::Taken { name, path } => status(json!({ "t": "taken", "name": name, "path": path.to_string_lossy() })),
+        NetEvent::TakeFailed { name, error } => status(json!({ "t": "take_failed", "name": name, "text": error })),
         _ => return None,
     })
 }
@@ -154,17 +197,21 @@ pub fn connect(fingerprint: &str, client_name: &str, max_height: u32) -> Result<
         bitrate_kbps: host.internet.then_some(8_000),
         ..Default::default()
     };
+    let internet = host.internet;
     let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE);
     let (req_tx, req_rx) = sync_channel::<()>(1);
     let lagging = Arc::new(AtomicBool::new(false));
-    let net = connection::spawn(host, settings, client_name.to_string(), move |ev| {
+    let net = connection::spawn(host, settings.clone(), client_name.to_string(), move |ev| {
         let video = matches!(ev, NetEvent::Frame { .. });
+        // Like frames, these are soon superseded: dropped rather than waited for.
+        let droppable = matches!(ev, NetEvent::Clock { .. } | NetEvent::FileProgress { .. } | NetEvent::TakeProgress { .. });
         if matches!(&ev, NetEvent::Frame { meta, .. } if meta.keyframe) {
             lagging.store(false, Ordering::Relaxed);
         }
         let Some(b) = encode(ev) else { return };
         match tx.try_send(b) {
             Ok(()) => {}
+            Err(TrySendError::Full(_)) if droppable => {}
             Err(TrySendError::Full(b)) if !video => {
                 // Status matters more than a frame: wait for room.
                 let _ = tx.send(b);
@@ -178,6 +225,10 @@ pub fn connect(fingerprint: &str, client_name: &str, max_height: u32) -> Result<
             Err(TrySendError::Disconnected(_)) => {}
         }
     })?;
+    if !internet {
+        // From home, so it can be reached away from it later.
+        let _ = net.tx.send(Outgoing::LinkInternet);
+    }
     let keyframes = net.tx.clone();
     std::thread::Builder::new().name("remote-keyframe".into()).spawn(move || {
         while req_rx.recv().is_ok() {
@@ -186,7 +237,7 @@ pub fn connect(fingerprint: &str, client_name: &str, max_height: u32) -> Result<
             }
         }
     })?;
-    Ok(Box::new(Session { net, events: Mutex::new(rx), seq: AtomicU32::new(0) }))
+    Ok(Box::new(Session { net, settings: Mutex::new(settings), events: Mutex::new(rx), seq: AtomicU32::new(0) }))
 }
 
 impl Session {
@@ -206,6 +257,38 @@ impl Session {
     pub fn motion(&self, x: f32, y: f32) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let _ = self.net.tx.send(Outgoing::Motion(Motion::Abs { seq, x, y }));
+    }
+
+    /// Streams the PC's monitor `name` instead.
+    pub fn monitor(&self, name: String) {
+        let s = {
+            let mut s = self.settings.lock().unwrap();
+            s.monitor = Some(name);
+            s.clone()
+        };
+        self.msg(ClientMsg::UpdateSettings(s));
+    }
+
+    /// Drops the connection and dials again now: the PC lets go of every
+    /// key and button and starts input afresh.
+    pub fn reconnect(&self) {
+        let _ = self.net.tx.send(Outgoing::Reconnect(std::time::Instant::now()));
+    }
+
+    /// Sends the file at `path` (on the phone) to the PC's Downloads.
+    pub fn send_file(&self, path: String) {
+        let _ = self.net.tx.send(Outgoing::SendFile { path: path.into(), drop_at: None });
+    }
+
+    /// Lists the PC's folder `dir` (home if empty), or its subfolder `name`:
+    /// answered by a `listing` event with the same `id`.
+    pub fn list_files(&self, id: u64, dir: String, name: Option<String>) {
+        let _ = self.net.tx.send(Outgoing::ListFiles { id, dir, name });
+    }
+
+    /// Copies the PC's file `name` in `dir` into the phone's folder `dest`.
+    pub fn take_file(&self, dir: String, name: String, dest: String) {
+        let _ = self.net.tx.send(Outgoing::TakeFile { dir, name, dest: dest.into() });
     }
 
     /// Puts `text` on the PC's clipboard.
@@ -383,6 +466,61 @@ pub extern "system" fn Java_org_androidcontroller_keeper_Remote_setClipboard(mut
     let text = jstr(&mut env, &text);
     if let Some(s) = session(h) {
         s.clipboard(text);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_androidcontroller_keeper_Remote_monitor(mut env: JNIEnv, _: JClass, h: jlong, name: JString) {
+    let name = jstr(&mut env, &name);
+    if let Some(s) = session(h) {
+        s.monitor(name);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_androidcontroller_keeper_Remote_reconnect(_: JNIEnv, _: JClass, h: jlong) {
+    if let Some(s) = session(h) {
+        s.reconnect();
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_androidcontroller_keeper_Remote_sendFile(mut env: JNIEnv, _: JClass, h: jlong, path: JString) {
+    let path = jstr(&mut env, &path);
+    if let Some(s) = session(h) {
+        s.send_file(path);
+    }
+}
+
+/// `name` may be null: list `dir` itself.
+#[no_mangle]
+pub extern "system" fn Java_org_androidcontroller_keeper_Remote_listFiles(
+    mut env: JNIEnv,
+    _: JClass,
+    h: jlong,
+    id: jlong,
+    dir: JString,
+    name: JString,
+) {
+    let dir = jstr(&mut env, &dir);
+    let name = (!name.is_null()).then(|| jstr(&mut env, &name));
+    if let Some(s) = session(h) {
+        s.list_files(id as u64, dir, name);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_androidcontroller_keeper_Remote_takeFile(
+    mut env: JNIEnv,
+    _: JClass,
+    h: jlong,
+    dir: JString,
+    name: JString,
+    dest: JString,
+) {
+    let (d, n, to) = (jstr(&mut env, &dir), jstr(&mut env, &name), jstr(&mut env, &dest));
+    if let Some(s) = session(h) {
+        s.take_file(d, n, to);
     }
 }
 

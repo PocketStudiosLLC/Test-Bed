@@ -105,11 +105,12 @@ public final class MonitorActivity extends Activity {
         statusView.setGravity(Gravity.CENTER);
         root.addView(statusView, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
 
-        exitBar = new Button(this);
-        exitBar.setText("Exit Monitor");
+        exitBar = Ui.button(this, "Exit Monitor", Ui.Kind.DESTRUCTIVE);
+        exitBar.setPadding(Ui.dp(this, 24), Ui.dp(this, 12), Ui.dp(this, 24), Ui.dp(this, 12));
         exitBar.setVisibility(View.GONE);
         exitBar.setOnClickListener(v -> Monitor.userToggle(this, false));
         root.addView(exitBar, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
+        ((FrameLayout.LayoutParams) exitBar.getLayoutParams()).bottomMargin = Ui.dp(this, 24);
 
         setContentView(root);
     }

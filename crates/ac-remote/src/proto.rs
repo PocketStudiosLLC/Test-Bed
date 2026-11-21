@@ -105,6 +105,14 @@ pub async fn read_msg<T: DeserializeOwned>(r: &mut crate::net::RecvStream) -> Re
 /// Read one message and whatever [`write_msg_extra`] put after it, if
 /// anything (`None` when the sender wrote a plain message).
 pub async fn read_msg_extra<T: DeserializeOwned, E: DeserializeOwned>(r: &mut crate::net::RecvStream) -> Result<Option<(T, Option<E>)>> {
+    match read_frame(r).await? {
+        Some(body) => Ok(Some(decode_extra(&body)?)),
+        None => Ok(None),
+    }
+}
+
+/// One length-prefixed frame's body; `Ok(None)` on clean end of stream.
+async fn read_frame(r: &mut crate::net::RecvStream) -> Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     if !r.read_exact_or_end(&mut len).await? {
         return Ok(None);
@@ -115,7 +123,7 @@ pub async fn read_msg_extra<T: DeserializeOwned, E: DeserializeOwned>(r: &mut cr
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    Ok(Some(decode_extra(&body)?))
+    Ok(Some(body))
 }
 
 fn decode_extra<T: DeserializeOwned, E: DeserializeOwned>(body: &[u8]) -> Result<(T, Option<E>)> {
@@ -145,6 +153,126 @@ pub enum FileReply {
     Ready { folder: String },
     Saved { path: String },
     Refused { text: String },
+}
+
+/// Taking files from the shared PC (Test Bed 2.5.1+), on a file stream like
+/// a [`FileOffer`]: the viewer opens a stream and writes one [`FetchRequest`]
+/// with [`write_fetch`]; the host answers with one [`FetchReply`] and, for
+/// `Get`, the file's bytes, then finishes the stream.
+///
+/// The frame starts with [`FETCH_MAGIC`]: an older host reads it as a
+/// `FileOffer` whose name isn't UTF-8 and drops the stream before saving
+/// anything.
+pub const FETCH_MAGIC: [u8; 2] = [0x01, 0xFF];
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum FetchRequest {
+    /// List folder `dir` (or, with `name`, its subfolder `name`). An empty
+    /// `dir` is the host user's home folder.
+    List { dir: String, name: Option<String> },
+    /// Send file `name` in folder `dir`.
+    Get { dir: String, name: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    pub dir: bool,
+    /// Hidden on the host (a dot file, or Windows' hidden attribute).
+    pub hidden: bool,
+    pub size: u64,
+    /// Seconds since 1970, if known.
+    pub modified: Option<u64>,
+}
+
+/// A folder to start from: home, Downloads, a drive …
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Place {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Listing {
+    /// The folder listed, as a path on the host.
+    pub path: String,
+    pub parent: Option<String>,
+    /// Folders first, then by name.
+    pub entries: Vec<DirEntry>,
+    /// Entries left out to keep the reply small.
+    pub omitted: u32,
+    pub places: Vec<Place>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum FetchReply {
+    Listing(Listing),
+    /// `size` bytes of the file follow.
+    Sending { name: String, size: u64 },
+    Refused { text: String },
+}
+
+/// Over a LAN session (Test Bed 2.5.1+), on a stream like a file's: the
+/// viewer asks to be let in over the internet too, so it can reach the host
+/// away from this network. The frame starts with [`LINK_MAGIC`] (an older
+/// host drops it, as with [`FETCH_MAGIC`]); the host answers [`LinkReply`].
+pub const LINK_MAGIC: [u8; 2] = [0x01, 0xFE];
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LinkRequest {
+    /// The viewer's iroh endpoint id.
+    pub client_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum LinkReply {
+    /// `host_id` is the host's iroh endpoint id; `relay` its home relay.
+    Linked { host_id: String, relay: Option<String> },
+    Refused { text: String },
+}
+
+/// What a file stream starts with.
+#[derive(Debug)]
+pub enum FileHead {
+    Offer(FileOffer),
+    Fetch(FetchRequest),
+    Link(LinkRequest),
+}
+
+pub async fn write_link(w: &mut crate::net::SendStream, req: &LinkRequest) -> Result<()> {
+    let mut body = LINK_MAGIC.to_vec();
+    body.extend_from_slice(&postcard::to_stdvec(req)?);
+    let mut buf = Vec::with_capacity(body.len() + 4);
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&body);
+    w.write_all(&buf).await?;
+    Ok(())
+}
+
+pub async fn write_fetch(w: &mut crate::net::SendStream, req: &FetchRequest) -> Result<()> {
+    let mut body = FETCH_MAGIC.to_vec();
+    body.extend_from_slice(&postcard::to_stdvec(req)?);
+    let mut buf = Vec::with_capacity(body.len() + 4);
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&body);
+    w.write_all(&buf).await?;
+    Ok(())
+}
+
+/// The first message on a file stream; `Ok(None)` if there was none.
+pub async fn read_file_head(r: &mut crate::net::RecvStream) -> Result<Option<FileHead>> {
+    let Some(body) = read_frame(r).await? else { return Ok(None) };
+    Ok(Some(decode_file_head(&body)?))
+}
+
+fn decode_file_head(body: &[u8]) -> Result<FileHead> {
+    if let Some(rest) = body.strip_prefix(&FETCH_MAGIC[..]) {
+        return Ok(FileHead::Fetch(postcard::from_bytes(rest)?));
+    }
+    if let Some(rest) = body.strip_prefix(&LINK_MAGIC[..]) {
+        return Ok(FileHead::Link(postcard::from_bytes(rest)?));
+    }
+    Ok(FileHead::Offer(postcard::take_from_bytes(body)?.0))
 }
 
 /// Clipboard text, each message on a one-way stream of its own (Test Bed
@@ -272,6 +400,24 @@ mod tests {
         let cut = clip_text(&long);
         assert!(cut.len() <= CLIP_MAX && cut.len() >= CLIP_MAX - 1);
         assert!(cut.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn fetch_requests_are_not_offers() {
+        let req = FetchRequest::Get { dir: "/home/me".into(), name: "a.txt".into() };
+        let mut body = FETCH_MAGIC.to_vec();
+        body.extend_from_slice(&postcard::to_stdvec(&req).unwrap());
+        // An older host decodes a FileOffer and gives up.
+        assert!(postcard::take_from_bytes::<FileOffer>(&body).is_err());
+        assert!(matches!(decode_file_head(&body).unwrap(), FileHead::Fetch(FetchRequest::Get { name, .. }) if name == "a.txt"));
+        let link = LinkRequest { client_id: "abc".into() };
+        let mut body = LINK_MAGIC.to_vec();
+        body.extend_from_slice(&postcard::to_stdvec(&link).unwrap());
+        assert!(postcard::take_from_bytes::<FileOffer>(&body).is_err());
+        assert!(matches!(decode_file_head(&body).unwrap(), FileHead::Link(l) if l.client_id == "abc"));
+        let offer = FileOffer { name: "b.txt".into(), size: 3, drop_at: None };
+        let body = postcard::to_stdvec(&offer).unwrap();
+        assert!(matches!(decode_file_head(&body).unwrap(), FileHead::Offer(o) if o.name == "b.txt"));
     }
 
     #[test]
