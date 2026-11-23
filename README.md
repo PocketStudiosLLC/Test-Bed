@@ -68,8 +68,10 @@ the connection and dials again at once: the PC lets go of every key and button
 and starts input afresh. It also cuts short a wait between retries.
 
 **Send file** copies files to the PC's Downloads folder (or drop them on its
-screen). **Receive files** goes the other way: browse the PC's folders, tick
-files, and they're copied to this PC's Downloads. The camera button saves
+screen). **Receive files** goes the other way: browse the PC's folders and tick
+files or whole folders (a folder comes with everything in it). They're copied
+to this PC's Downloads, or to the folder picked with **Change…** at the bottom
+of the dialog, which is remembered. The camera button saves
 what the PC's screen shows now as a PNG in Pictures/Screenshots. The PC shows a notification
 for each file taken. The PC needs a Test Bed newer than 2.5 to share its files.
 

@@ -204,6 +204,46 @@ async fn takes_files() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A whole folder comes over, subfolders and empty folders included, into a
+/// free name beside an existing folder of the same name.
+#[tokio::test]
+async fn takes_folders() {
+    let (_host, _client, h, c) = connect(ALPN_SESSION).await;
+    let dir = std::env::temp_dir().join(format!("tb-take-folder-{}", std::process::id()));
+    let (src, dest) = (dir.join("src"), dir.join("dest"));
+    let album = src.join("Album");
+    std::fs::create_dir_all(album.join("2024/raw")).unwrap();
+    std::fs::create_dir_all(album.join("empty")).unwrap();
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(album.join("cover.png"), b"png").unwrap();
+    std::fs::write(album.join("2024/a.jpg"), &data).unwrap();
+    std::fs::write(album.join("2024/raw/a.dng"), b"raw").unwrap();
+    std::fs::create_dir_all(dest.join("Album")).unwrap();
+    tokio::spawn(async move {
+        while let Ok((s, r)) = h.accept_bi().await {
+            tokio::spawn(ac_remote::files::serve(s, r, |_| unreachable!()));
+        }
+    });
+    let mut seen = Vec::new();
+    let t = ac_remote::files::take_folder(&c, &src.display().to_string(), "Album", &dest, |f, g, total| {
+        if g == total {
+            seen.push(f.to_string());
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(t.path, dest.join("Album (2)"));
+    assert_eq!((t.files, t.bytes, t.failed.len(), t.omitted), (3, data.len() as u64 + 6, 0, 0));
+    assert_eq!(std::fs::read(t.path.join("2024/a.jpg")).unwrap(), data);
+    assert_eq!(std::fs::read(t.path.join("2024/raw/a.dng")).unwrap(), b"raw");
+    assert_eq!(std::fs::read(t.path.join("cover.png")).unwrap(), b"png");
+    assert!(t.path.join("empty").is_dir());
+    seen.sort();
+    assert_eq!(seen, ["2024/a.jpg", "2024/raw/a.dng", "cover.png"]);
+    assert_eq!(t.summary("Album"), "Album (3 files)");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A 2.5 host reads a fetch as a file offer it can't decode and drops the
 /// stream: the viewer says to update rather than waiting.
 #[tokio::test]

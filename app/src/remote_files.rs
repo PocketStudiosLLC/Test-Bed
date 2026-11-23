@@ -1,22 +1,27 @@
 //! Receive files: a browser of a remote PC's folders, opened from its
-//! viewer. The PC lists one folder at a time; the files ticked are copied to
-//! this PC's Downloads by the viewer.
+//! viewer. The PC lists one folder at a time; the files and folders ticked
+//! are copied by the viewer to the folder chosen at the bottom (Downloads
+//! unless changed; the choice is remembered).
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use ac_remote::proto::{DirEntry, Listing};
 use adw::prelude::*;
 use gtk::glib;
 
+/// Copy these entries of folder `dir` (name, is a folder) into a folder on
+/// this PC.
+pub type Take = Box<dyn Fn(String, Vec<(String, bool)>, PathBuf)>;
+
 /// What the browser asks of its viewer.
 pub struct Ask {
     /// List folder `dir` (home if empty), or its subfolder `name`; the
     /// answer comes back through [`Browser::listing`] with the same id.
     pub list: Box<dyn Fn(u64, String, Option<String>)>,
-    /// Copy these files of folder `dir` here.
-    pub take: Box<dyn Fn(String, Vec<String>)>,
+    pub take: Take,
     /// The dialog closed.
     pub closed: Box<dyn Fn()>,
 }
@@ -47,6 +52,8 @@ pub struct Browser {
     receive: gtk::Button,
     show_hidden: gtk::CheckButton,
     omitted: gtk::Label,
+    dest_label: gtk::Label,
+    dest: RefCell<PathBuf>,
     /// Setting the dropdown from code, not the user.
     quiet: Cell<bool>,
     state: RefCell<State>,
@@ -90,12 +97,31 @@ impl Browser {
         footer.append(&show_hidden);
         footer.append(&omitted);
 
+        // Where the files go on this PC.
+        let dest = receive_dir();
+        let dest_label = gtk::Label::builder()
+            .label(dest.display().to_string())
+            .tooltip_text(dest.display().to_string())
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Start)
+            .css_classes(["monospace"])
+            .build();
+        let change = gtk::Button::builder().label("Change…").tooltip_text("Choose the folder on this PC the files are saved in").build();
+        let save_row = gtk::Box::builder().spacing(12).margin_start(12).margin_end(12).margin_top(6).margin_bottom(6).build();
+        save_row.append(&gtk::Image::from_icon_name("folder-download-symbolic"));
+        save_row.append(&gtk::Label::builder().label("Save to").css_classes(["dim-label"]).build());
+        save_row.append(&dest_label);
+        save_row.append(&change);
+
         let body = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
         body.append(&path);
         body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         body.append(&stack);
         body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         body.append(&footer);
+        body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        body.append(&save_row);
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&body));
         let view = adw::ToolbarView::new();
@@ -104,7 +130,7 @@ impl Browser {
         let dialog = adw::Dialog::builder()
             .title(format!("Receive files from {host_name}"))
             .content_width(600)
-            .content_height(560)
+            .content_height(600)
             .child(&view)
             .build();
 
@@ -121,6 +147,8 @@ impl Browser {
             receive,
             show_hidden,
             omitted,
+            dest_label,
+            dest: RefCell::new(dest),
             quiet: Cell::new(false),
             state: RefCell::default(),
             ask,
@@ -173,13 +201,22 @@ impl Browser {
         let weak = Rc::downgrade(&b);
         b.receive.connect_clicked(move |_| {
             let Some(b) = weak.upgrade() else { return };
-            let (dir, names) = {
+            let (dir, items) = {
                 let s = b.state.borrow();
-                (s.listing.as_ref().map(|l| l.path.clone()).unwrap_or_default(), s.picked.iter().cloned().collect::<Vec<_>>())
+                let entries = s.listing.as_ref().map(|l| l.entries.as_slice()).unwrap_or_default();
+                let items: Vec<(String, bool)> =
+                    s.picked.iter().filter_map(|n| entries.iter().find(|e| &e.name == n)).map(|e| (e.name.clone(), e.dir)).collect();
+                (s.listing.as_ref().map(|l| l.path.clone()).unwrap_or_default(), items)
             };
-            if !names.is_empty() {
-                (b.ask.take)(dir, names);
+            if !items.is_empty() {
+                (b.ask.take)(dir, items, b.dest.borrow().clone());
                 b.dialog.close();
+            }
+        });
+        let weak = Rc::downgrade(&b);
+        change.connect_clicked(move |_| {
+            if let Some(b) = weak.upgrade() {
+                b.choose_dest();
             }
         });
         let weak = Rc::downgrade(&b);
@@ -192,6 +229,29 @@ impl Browser {
         b.dialog.present(Some(parent));
         b.request(String::new(), None);
         b
+    }
+
+    /// Asks for the folder on this PC to save in, and remembers it.
+    fn choose_dest(self: &Rc<Self>) {
+        let dialog = gtk::FileDialog::builder().title("Save Received Files To").accept_label("Select").modal(true).build();
+        let current = self.dest.borrow().clone();
+        if current.is_dir() {
+            dialog.set_initial_folder(Some(&gtk::gio::File::for_path(&current)));
+        }
+        let parent = self.dialog.root().and_downcast::<gtk::Window>();
+        let weak = Rc::downgrade(self);
+        dialog.select_folder(parent.as_ref(), gtk::gio::Cancellable::NONE, move |r| {
+            let (Some(b), Ok(f)) = (weak.upgrade(), r) else { return };
+            let Some(p) = f.path() else { return };
+            b.dest_label.set_label(&p.display().to_string());
+            b.dest_label.set_tooltip_text(Some(&p.display().to_string()));
+            *b.dest.borrow_mut() = p.clone();
+            let mut cfg = ac_remote::config::ClientConfig::load().unwrap_or_default();
+            cfg.receive_dir = p.display().to_string();
+            if let Err(e) = cfg.save() {
+                b.toasts.add_toast(adw::Toast::new(&format!("Used this time only: {e:#}")));
+            }
+        });
     }
 
     pub fn close(&self) {
@@ -262,7 +322,7 @@ impl Browser {
         self.receive.set_sensitive(n > 0);
         self.receive.set_label(&match n {
             0 | 1 => "Receive".to_string(),
-            n => format!("Receive {n} files"),
+            n => format!("Receive {n} items"),
         });
     }
 
@@ -312,10 +372,11 @@ impl Browser {
         line.append(&icon);
         line.append(&name);
         line.append(&detail);
-        if e.dir {
-            line.append(&gtk::Image::from_icon_name("go-next-symbolic"));
-        } else {
+        {
+            // Folders can be ticked too: they come with everything in them.
             let check = gtk::CheckButton::new();
+            check.set_tooltip_text(Some(if e.dir { "Receive this folder and everything in it" } else { "Receive this file" }));
+            check.update_property(&[gtk::accessible::Property::Label(&format!("Receive {}", e.name))]);
             check.set_active(self.state.borrow().picked.contains(&e.name));
             let file = e.name.clone();
             let weak = Rc::downgrade(self);
@@ -333,6 +394,16 @@ impl Browser {
             });
             line.append(&check);
         }
+        if e.dir {
+            line.append(&gtk::Image::from_icon_name("go-next-symbolic"));
+        }
         gtk::ListBoxRow::builder().child(&line).activatable(true).build()
     }
+}
+
+/// The folder received files go to: the one chosen last, or Downloads.
+pub fn receive_dir() -> PathBuf {
+    let chosen = ac_remote::config::ClientConfig::load().map(|c| c.receive_dir).unwrap_or_default();
+    let chosen = chosen.trim();
+    if chosen.is_empty() { ac_remote::files::downloads_dir() } else { PathBuf::from(chosen) }
 }

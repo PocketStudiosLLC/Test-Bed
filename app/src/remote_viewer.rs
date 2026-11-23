@@ -244,7 +244,7 @@ impl Viewer {
         let receive_content = adw::ButtonContent::builder().icon_name("folder-download-symbolic").label("Receive files").build();
         let receive_button = gtk::Button::builder()
             .child(&receive_content)
-            .tooltip_text(format!("Copy files from {} to the Downloads folder on this PC", host.name))
+            .tooltip_text(format!("Copy files and folders from {} to this PC", host.name))
             .sensitive(false)
             .build();
         let screenshot_button = gtk::Button::builder()
@@ -854,9 +854,9 @@ impl Viewer {
         };
         let take = {
             let weak = Rc::downgrade(self);
-            Box::new(move |dir: String, names: Vec<String>| {
+            Box::new(move |dir: String, items: Vec<(String, bool)>, dest: std::path::PathBuf| {
                 if let Some(v) = weak.upgrade() {
-                    v.take_files(dir, names);
+                    v.take_files(dir, items, dest);
                 }
             })
         };
@@ -878,15 +878,14 @@ impl Viewer {
         self.update_grab();
     }
 
-    fn take_files(&self, dir: String, names: Vec<String>) {
+    fn take_files(&self, dir: String, items: Vec<(String, bool)>, dest: std::path::PathBuf) {
         if !self.state.borrow().connected {
             self.tab.viewer_message(&format!("Connect to {} to receive files", self.host.name));
             return;
         }
-        let dest = ac_remote::files::downloads_dir();
-        for name in names {
+        for (name, folder) in items {
             self.state.borrow_mut().takes_pending += 1;
-            let _ = self.net.tx.send(Outgoing::TakeFile { dir: dir.clone(), name, dest: dest.clone() });
+            let _ = self.net.tx.send(Outgoing::TakeFile { dir: dir.clone(), name, dest: dest.clone(), folder });
         }
         if !self.transfer.is_visible() {
             self.transfer.set_label("Receiving…");

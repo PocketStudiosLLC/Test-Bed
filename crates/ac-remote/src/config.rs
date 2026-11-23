@@ -70,6 +70,8 @@ pub struct ClientConfig {
     pub name: String,
     /// Relay server for internet connections. Empty = n0's public relays.
     pub relay: String,
+    /// Where files received from other PCs go. Empty = Downloads.
+    pub receive_dir: String,
 }
 
 impl Default for ClientConfig {
@@ -86,6 +88,7 @@ impl Default for ClientConfig {
             show_stats: false,
             name: String::new(),
             relay: String::new(),
+            receive_dir: String::new(),
         }
     }
 }

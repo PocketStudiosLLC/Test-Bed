@@ -79,8 +79,9 @@ pub enum Outgoing {
     /// List the host's folder `dir` (its home if empty), or its subfolder
     /// `name`: answered by [`NetEvent::Listing`] with the same `id`.
     ListFiles { id: u64, dir: String, name: Option<String> },
-    /// Copy the host's file `name` in `dir` into `dest` on this PC.
-    TakeFile { dir: String, name: String, dest: std::path::PathBuf },
+    /// Copy the host's file `name` in `dir` into `dest` on this PC; with
+    /// `folder`, its folder `name` and everything in it.
+    TakeFile { dir: String, name: String, dest: std::path::PathBuf, folder: bool },
     /// Put this text on the host's clipboard.
     Clipboard(String),
     /// Hear about the host's clipboard ([`NetEvent::Clipboard`]), from now on
@@ -508,13 +509,29 @@ async fn run_session(
     };
 
     // Files from the host, one at a time, beside the ones going to it.
-    let (take_tx, mut take_rx) = mpsc::unbounded_channel::<(String, String, std::path::PathBuf)>();
+    let (take_tx, mut take_rx) = mpsc::unbounded_channel::<(String, String, std::path::PathBuf, bool)>();
     let takes = {
         let conn = conn.clone();
         let events = events.clone();
         async move {
-            while let Some((dir, name, dest)) = take_rx.recv().await {
+            while let Some((dir, name, dest, folder)) = take_rx.recv().await {
                 let mut shown = Instant::now() - Duration::from_secs(1);
+                if folder {
+                    let progress = |file: &str, got: u64, total: u64| {
+                        if got == total || shown.elapsed() >= Duration::from_millis(100) {
+                            shown = Instant::now();
+                            events(NetEvent::TakeProgress { name: format!("{name}/{file}"), got, total });
+                        }
+                    };
+                    match crate::files::take_folder(&conn, &dir, &name, &dest, progress).await {
+                        Ok(t) if t.files == 0 && !t.failed.is_empty() => {
+                            events(NetEvent::TakeFailed { name: name.clone(), error: t.summary(&name) })
+                        }
+                        Ok(t) => events(NetEvent::Taken { name: t.summary(&name), path: t.path }),
+                        Err(e) => events(NetEvent::TakeFailed { name, error: format!("{e:#}") }),
+                    }
+                    continue;
+                }
                 let progress = |got: u64, total: u64| {
                     if got == total || shown.elapsed() >= Duration::from_millis(100) {
                         shown = Instant::now();
@@ -570,8 +587,8 @@ async fn run_session(
                         Some(Outgoing::SendFile { path, drop_at }) => {
                             let _ = file_tx.send((path, drop_at));
                         }
-                        Some(Outgoing::TakeFile { dir, name, dest }) => {
-                            let _ = take_tx.send((dir, name, dest));
+                        Some(Outgoing::TakeFile { dir, name, dest, folder }) => {
+                            let _ = take_tx.send((dir, name, dest, folder));
                         }
                         Some(Outgoing::ListFiles { id, dir, name }) => {
                             // Not queued behind files: browsing stays quick.

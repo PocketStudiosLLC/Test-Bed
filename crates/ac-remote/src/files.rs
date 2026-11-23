@@ -277,6 +277,79 @@ pub async fn take(conn: &Conn, dir: &str, name: &str, dest: &Path, mut progress:
     Ok(to)
 }
 
+/// How [`take_folder`] went.
+#[derive(Debug, Default)]
+pub struct FolderTaken {
+    /// The new folder on this PC.
+    pub path: PathBuf,
+    pub files: u32,
+    pub bytes: u64,
+    /// Files that couldn't be copied, and why.
+    pub failed: Vec<(String, String)>,
+    /// Entries the host left out of a big folder's listing.
+    pub omitted: u32,
+}
+
+impl FolderTaken {
+    /// "Photos (120 files, 2 couldn't be copied)".
+    pub fn summary(&self, name: &str) -> String {
+        let mut parts = vec![format!("{} file{}", self.files, if self.files == 1 { "" } else { "s" })];
+        match self.failed.as_slice() {
+            [] => {}
+            [(file, why)] => parts.push(format!("{file} couldn't be copied: {why}")),
+            many => parts.push(format!("{} couldn't be copied", many.len())),
+        }
+        if self.omitted > 0 {
+            parts.push(format!("{} left out (folder too big to list)", self.omitted));
+        }
+        format!("{name} ({})", parts.join(", "))
+    }
+}
+
+/// Folders nested deeper than this aren't followed (a linked folder may loop).
+const MAX_FOLDER_DEPTH: usize = 32;
+
+/// Copies the host's folder `name` in `dir`, with everything in it, into a
+/// new folder in `dest` (under a free name). `progress(file, got, total)`
+/// follows each file, `file` being its path inside the folder. Works with
+/// any host that can share files: the folder is walked through listings.
+pub async fn take_folder(conn: &Conn, dir: &str, name: &str, dest: &Path, mut progress: impl FnMut(&str, u64, u64)) -> Result<FolderTaken> {
+    let root = list(conn, dir, Some(name)).await?;
+    tokio::fs::create_dir_all(dest).await.with_context(|| format!("can't save in {}", dest.display()))?;
+    let local_root = unique_path(dest, &safe_name(name));
+    let mut out = FolderTaken { path: local_root.clone(), ..FolderTaken::default() };
+    // (listing, local folder, path inside the taken folder, depth)
+    let mut todo = vec![(root, local_root, String::new(), 0usize)];
+    while let Some((listing, local, rel, depth)) = todo.pop() {
+        tokio::fs::create_dir_all(&local).await.with_context(|| format!("can't create {}", local.display()))?;
+        out.omitted += listing.omitted;
+        for e in &listing.entries {
+            let inner = if rel.is_empty() { e.name.clone() } else { format!("{rel}/{}", e.name) };
+            if e.dir {
+                if depth + 1 >= MAX_FOLDER_DEPTH {
+                    out.failed.push((inner, "nested too deep".into()));
+                    continue;
+                }
+                match list(conn, &listing.path, Some(&e.name)).await {
+                    Ok(sub) => todo.push((sub, local.join(safe_name(&e.name)), inner, depth + 1)),
+                    Err(err) => out.failed.push((inner, format!("{err:#}"))),
+                }
+                continue;
+            }
+            match take(conn, &listing.path, &e.name, &local, |got, total| progress(&inner, got, total)).await {
+                Ok(_) => {
+                    out.files += 1;
+                    out.bytes += e.size;
+                }
+                // The connection is gone: stop rather than fail every file.
+                Err(err) if conn.is_closed() => return Err(err.context(format!("stopped after {} files", out.files))),
+                Err(err) => out.failed.push((inner, format!("{err:#}"))),
+            }
+        }
+    }
+    Ok(out)
+}
+
 struct RemoveOnDrop(PathBuf);
 
 impl Drop for RemoveOnDrop {

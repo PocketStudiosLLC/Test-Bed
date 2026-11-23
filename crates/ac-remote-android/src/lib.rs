@@ -288,7 +288,7 @@ impl Session {
 
     /// Copies the PC's file `name` in `dir` into the phone's folder `dest`.
     pub fn take_file(&self, dir: String, name: String, dest: String) {
-        let _ = self.net.tx.send(Outgoing::TakeFile { dir, name, dest: dest.into() });
+        let _ = self.net.tx.send(Outgoing::TakeFile { dir, name, dest: dest.into(), folder: false });
     }
 
     /// Puts `text` on the PC's clipboard.
