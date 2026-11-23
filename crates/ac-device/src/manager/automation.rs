@@ -334,7 +334,7 @@ impl Manager {
                     let Some(id) = self.slots[i].device_id().map(str::to_owned) else { continue };
                     names.push((t.slot, t.name.clone()));
                     let mut results = self.transfers.install_results();
-                    self.transfers.submit(t.slot, id, t.name.clone(), vec![path.clone()], true);
+                    self.transfers.submit(t.slot, id, t.name.clone(), vec![path.clone()], true, None);
                     jobs.push(Box::pin(async move {
                         let wait = async {
                             loop {

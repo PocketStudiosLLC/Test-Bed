@@ -27,6 +27,9 @@ use tokio::task::AbortHandle;
 use crate::api::{AppKind, TransferView, UiEvent};
 use crate::stream::SlotIo;
 
+mod receive;
+pub use receive::{receive_root, sort_entries};
+
 /// Host reads (spec §5.4).
 const READ_BLOCK: usize = 1 << 20;
 /// A write that makes no progress this long means the link is dead.
@@ -252,6 +255,8 @@ struct SlotShared {
     /// One install at a time: Android confirms one install at a time, and a
     /// second one hides the first's confirmation on phones without ADB.
     installs: Semaphore,
+    /// The running receive from this phone, if any.
+    receive: Mutex<Option<AbortHandle>>,
 }
 
 struct Ctx {
@@ -295,6 +300,7 @@ impl Transfers {
                 link,
                 sem: Semaphore::new(per_device),
                 installs: Semaphore::new(1),
+                receive: Mutex::default(),
             })
             .collect();
         let ctx = Arc::new(Ctx {
@@ -406,7 +412,8 @@ impl Transfers {
         self.ctx.installs.subscribe()
     }
 
-    pub fn submit(&self, slot: SlotId, device_id: String, title: String, paths: Vec<PathBuf>, install_apks: bool) {
+    /// Files go to `target_dir` on the phone, or the configured default.
+    pub fn submit(&self, slot: SlotId, device_id: String, title: String, paths: Vec<PathBuf>, install_apks: bool, target_dir: Option<String>) {
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
             let cfg = ctx.cfg();
@@ -429,13 +436,16 @@ impl Transfers {
             if items.is_empty() {
                 return;
             }
-            ctx.enqueue(slot, device_id, title, items);
+            ctx.enqueue(slot, device_id, title, items, target_dir);
         });
     }
 
-    /// Cancels every queued and running transfer for `slot`.
+    /// Cancels every queued and running transfer for `slot`, both ways.
     pub fn cancel(&self, slot: SlotId) {
         let Some(s) = self.ctx.slot(slot) else { return };
+        if self.cancel_receive(slot) {
+            self.ctx.toast("Cancelled receiving files".into());
+        }
         let (aborts, cleanup, n) = {
             let mut b = s.batch.lock().unwrap();
             if b.count == 0 {
@@ -484,13 +494,14 @@ impl Ctx {
         let _ = self.ui.try_send(UiEvent::Toast { code: None, message });
     }
 
-    fn enqueue(self: &Arc<Self>, slot: SlotId, device_id: String, title: String, items: Vec<(Item, bool)>) {
+    fn enqueue(self: &Arc<Self>, slot: SlotId, device_id: String, title: String, items: Vec<(Item, bool)>, target_dir: Option<String>) {
+        let base = target_dir.unwrap_or_else(|| self.cfg().default_target_dir);
         let created = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let mut jobs = Vec::new();
         for (it, install) in items {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let name = it.local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let remote_dir = join(&self.cfg().default_target_dir, &[&it.rel_dir]);
+            let remote_dir = join(&base, &[&it.rel_dir]);
             let mtime = std::fs::metadata(&it.local).map_or(0, |m| mtime_of(&m));
             let verify = match self.cfg().verify_checksum.as_str() {
                 "always" => true,
@@ -967,8 +978,9 @@ impl Ctx {
     async fn send_direct(&self, slot: SlotId, link: &Link, d: &DirectTarget, job: &Job, install: bool) -> Result<Outcome, JobError> {
         self.check_local(job).await?;
         let cfg = self.cfg();
-        let base = cfg.default_target_dir.trim_end_matches('/');
-        let dir = job.remote_dir.strip_prefix(base).unwrap_or("").trim_matches('/').to_owned();
+        let dir = direct_dir(&job.remote_dir, &cfg.default_target_dir).ok_or_else(|| {
+            JobError::Fatal(format!("Without ADB the phone only takes files into its Download folder, not {}", job.remote_dir))
+        })?;
         let req = ac_direct::PushRequest {
             name: job.name.clone(),
             dir,
@@ -1016,6 +1028,19 @@ impl Ctx {
         }
         Ok(Outcome::Sent)
     }
+}
+
+/// The folder below Download that the helper writes `remote_dir` to: the
+/// helper always saves into Download. `None` for a folder outside it.
+fn direct_dir(remote_dir: &str, default_dir: &str) -> Option<String> {
+    const DOWNLOADS: [&str; 3] = ["/sdcard/Download", "/storage/emulated/0/Download", "/storage/self/primary/Download"];
+    let under = |base: &str| {
+        let base = base.trim_end_matches('/');
+        let rest = remote_dir.strip_prefix(base)?;
+        (rest.is_empty() || rest.starts_with('/')).then(|| rest.trim_matches('/').to_owned())
+    };
+    // The configured default (even outside Download) keeps working as before.
+    DOWNLOADS.iter().find_map(|d| under(d)).or_else(|| under(default_dir))
 }
 
 fn direct_err(e: ac_direct::Error) -> JobError {
@@ -1106,6 +1131,7 @@ fn view(slot: SlotId, b: &Batch, rate_bps: u64) -> TransferView {
         active: b.count > 0,
         file: b.current.as_ref().map(|c| c.1.clone()).unwrap_or_default(),
         installing: b.current.as_ref().is_some_and(|c| c.2 == Kind::Install),
+        receiving: false,
         index: (b.finished + 1).min(b.count),
         count: b.count,
         sent,
@@ -1164,6 +1190,17 @@ async fn report(ctx: std::sync::Weak<Ctx>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn direct_dirs() {
+        assert_eq!(direct_dir("/sdcard/Download", "/sdcard/Download").as_deref(), Some(""));
+        assert_eq!(direct_dir("/sdcard/Download/Pics/2024", "/sdcard/Download").as_deref(), Some("Pics/2024"));
+        assert_eq!(direct_dir("/storage/emulated/0/Download/x", "/sdcard/Download").as_deref(), Some("x"));
+        assert_eq!(direct_dir("/sdcard/Games/a", "/sdcard/Games").as_deref(), Some("a"));
+        assert_eq!(direct_dir("/sdcard/Downloads2", "/sdcard/Download"), None);
+        assert_eq!(direct_dir("/sdcard/DCIM", "/sdcard/Download"), None);
+    }
+
     use super::*;
 
     fn entry(id: u64, local: &Path, size: u64, mtime: u32) -> Entry {

@@ -4860,6 +4860,7 @@ dependencies = [
  "ac-transfer",
  "anyhow",
  "async-channel",
+ "directories",
  "gtk4",
  "libadwaita",
  "qrcode",

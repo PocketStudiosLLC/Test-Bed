@@ -42,6 +42,10 @@ pub enum CardAction {
     TypeClipboard,
     /// This phone's clipboard onto the PC's.
     CopyPhoneClipboard,
+    /// Pick the folder on the phone that sent files go to.
+    ChooseSendDir,
+    /// Browse the phone and copy files and folders from it to this PC.
+    Receive,
     CancelTransfers,
     Rename,
     UpdateHelper,
@@ -72,6 +76,8 @@ pub struct SlotCard {
     target_warning: gtk::Image,
     send: gtk::MenuButton,
     clipboard: gtk::MenuButton,
+    /// "Saves to /sdcard/Download" in the send menu.
+    send_dir: gtk::Label,
     stay_awake: gtk::ToggleButton,
     monitor: gtk::ToggleButton,
     monitor_touch: gtk::ToggleButton,
@@ -173,24 +179,40 @@ impl SlotCard {
         focus.set_tooltip_text(Some("Focus this phone (Alt+F)"));
         focus.add_css_class("flat");
         focus.set_visible(false);
-        // Send Files… / Send Folder… (spec §5.1 internal picker).
+        // Send Files… / Send Folder… (spec §5.1 internal picker), where they
+        // go on the phone, and receiving from it.
         let send_popover = gtk::Popover::new();
         let send_menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        for (label, action) in [("Send Files…", CardAction::SendFiles), ("Send Folder…", CardAction::SendFolder)] {
-            let b = gtk::Button::builder().label(label).build();
+        let item = |child: &gtk::Widget, action: CardAction| {
+            let b = gtk::Button::builder().child(child).build();
             b.add_css_class("flat");
-            b.child().and_downcast::<gtk::Label>().inspect(|l| l.set_xalign(0.0));
             let (on_action, popover) = (on_action.clone(), send_popover.clone());
             b.connect_clicked(move |_| {
                 popover.popdown();
                 on_action(slot, action);
             });
-            send_menu.append(&b);
-        }
+            b
+        };
+        let text = |label: &str| gtk::Label::builder().label(label).xalign(0.0).build().upcast::<gtk::Widget>();
+        send_menu.append(&item(&text("Send Files…"), CardAction::SendFiles));
+        send_menu.append(&item(&text("Send Folder…"), CardAction::SendFolder));
+        let send_dir = dim_label("");
+        send_dir.add_css_class("caption");
+        send_dir.set_max_width_chars(28);
+        let dir_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        dir_box.append(&text("Folder on the Phone…"));
+        dir_box.append(&send_dir);
+        let dir_item = item(dir_box.upcast_ref(), CardAction::ChooseSendDir);
+        dir_item.set_tooltip_text(Some("Choose where files sent to this phone are saved"));
+        send_menu.append(&dir_item);
+        send_menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let receive_item = item(&text("Receive from Phone…"), CardAction::Receive);
+        receive_item.set_tooltip_text(Some("Copy files and folders from this phone to this PC"));
+        send_menu.append(&receive_item);
         send_popover.set_child(Some(&send_menu));
         let send = gtk::MenuButton::builder()
             .icon_name("document-send-symbolic")
-            .tooltip_text("Send files to this phone (or drop them on it)")
+            .tooltip_text("Send or receive files (or drop files on the phone)")
             .popover(&send_popover)
             .visible(false)
             .build();
@@ -480,6 +502,7 @@ impl SlotCard {
             target_warning,
             send,
             clipboard,
+            send_dir,
             stay_awake,
             monitor,
             monitor_touch,
@@ -661,6 +684,12 @@ impl SlotCard {
         self.root.update_property(&[gtk::accessible::Property::Description(&self.a11y.borrow())]);
     }
 
+    /// The phone folder sent files go to, shown in the send menu.
+    pub fn set_send_dir(&self, dir: &str) {
+        self.send_dir.set_label(&format!("Saves to {dir}"));
+        self.send_dir.set_tooltip_text(Some(dir));
+    }
+
     /// Text over the tile while files are dragged onto it; `None` hides it.
     pub fn set_drop_hint(&self, hint: Option<&str>) {
         self.drop_hint.set_label(hint.unwrap_or_default());
@@ -677,7 +706,11 @@ impl SlotCard {
         if !v.active {
             return;
         }
-        let verb = if v.installing { "Installing" } else { "Sending" };
+        let verb = match (v.installing, v.receiving) {
+            (true, _) => "Installing",
+            (_, true) => "Receiving",
+            _ => "Sending",
+        };
         let mut parts = vec![if v.file.is_empty() { format!("{verb}…") } else { format!("{verb} {}", v.file) }];
         if v.count > 1 {
             parts.push(format!("{} of {}", v.index, v.count));

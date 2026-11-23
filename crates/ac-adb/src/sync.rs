@@ -47,6 +47,36 @@ fn check_path(path: &str) -> Result<(), AdbError> {
     Ok(())
 }
 
+/// `S_IFMT` and the file types [`DirEntry::mode`] can carry.
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
+
+/// One entry of a `LIST` reply. `size` is 32-bit in this protocol version:
+/// files of 4 GiB or more report their size modulo 2³².
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub mode: u32,
+    pub size: u32,
+    pub mtime: u32,
+}
+
+impl DirEntry {
+    pub fn is_dir(&self) -> bool {
+        self.mode & S_IFMT == S_IFDIR
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.mode & S_IFMT == S_IFREG
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.mode & S_IFMT == S_IFLNK
+    }
+}
+
 /// An open `sync:` stream.
 pub struct SyncSession<S> {
     stream: S,
@@ -139,6 +169,74 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SyncSession<S> {
         self.stream.write_all(&done).await?;
         self.stream.flush().await?;
         self.read_okay().await
+    }
+
+    /// Lists a folder (without `.` and `..`). A folder that is missing or
+    /// can't be read lists as empty: check it with [`Self::stat`] first.
+    pub async fn list(&mut self, path: &str) -> Result<Vec<DirEntry>, AdbError> {
+        check_path(path)?;
+        self.stream.write_all(&encode(b"LIST", path.as_bytes())).await?;
+        let mut out = Vec::new();
+        loop {
+            let mut h = [0u8; 20];
+            self.stream.read_exact(&mut h).await?;
+            let word = |i: usize| u32::from_le_bytes(h[i..i + 4].try_into().unwrap());
+            match &h[..4] {
+                b"DENT" => {
+                    let len = word(16) as usize;
+                    if len > SYNC_PATH_MAX {
+                        return Err(AdbError::Protocol(format!("LIST name of {len} bytes")));
+                    }
+                    let mut name = vec![0u8; len];
+                    self.stream.read_exact(&mut name).await?;
+                    let name = String::from_utf8_lossy(&name).into_owned();
+                    if name != "." && name != ".." {
+                        out.push(DirEntry { name, mode: word(4), size: word(8), mtime: word(12) });
+                    }
+                }
+                b"DONE" => return Ok(out),
+                other => return Err(AdbError::Protocol(format!("expected DENT/DONE, got {:?}", String::from_utf8_lossy(other)))),
+            }
+        }
+    }
+
+    /// Streams the phone's file `path` into `writer`. `on_progress` receives
+    /// the running byte count after each `DATA` packet. Returns the size.
+    pub async fn recv<W, F>(&mut self, path: &str, mut writer: W, mut on_progress: F) -> Result<u64, AdbError>
+    where
+        W: AsyncWrite + Unpin,
+        F: FnMut(u64),
+    {
+        check_path(path)?;
+        self.stream.write_all(&encode(b"RECV", path.as_bytes())).await?;
+        let mut buf = vec![0u8; SYNC_DATA_MAX];
+        let mut got = 0u64;
+        loop {
+            let mut h = [0u8; 8];
+            self.stream.read_exact(&mut h).await?;
+            let len = u32::from_le_bytes(h[4..8].try_into().unwrap()) as usize;
+            match &h[..4] {
+                b"DATA" => {
+                    if len > SYNC_DATA_MAX {
+                        return Err(AdbError::Protocol(format!("DATA of {len} bytes")));
+                    }
+                    self.stream.read_exact(&mut buf[..len]).await?;
+                    writer.write_all(&buf[..len]).await?;
+                    got += len as u64;
+                    on_progress(got);
+                }
+                b"DONE" => {
+                    writer.flush().await?;
+                    return Ok(got);
+                }
+                b"FAIL" => {
+                    let mut msg = vec![0u8; len.min(SYNC_DATA_MAX)];
+                    self.stream.read_exact(&mut msg).await?;
+                    return Err(AdbError::Fail(String::from_utf8_lossy(&msg).into_owned()));
+                }
+                other => return Err(AdbError::Protocol(format!("expected DATA/DONE, got {:?}", String::from_utf8_lossy(other)))),
+            }
+        }
     }
 
     async fn read_okay(&mut self) -> Result<(), AdbError> {

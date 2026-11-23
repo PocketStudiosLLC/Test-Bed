@@ -332,6 +332,56 @@ impl MockAdb {
                     self.with_state(|st| st.files.insert((serial.to_owned(), path), data));
                     s.write_all(b"OKAY\0\0\0\0").await?;
                 }
+                b"LIST" => {
+                    let path = read_exact_string(s, len).await?;
+                    let prefix = format!("{}/", path.trim_end_matches('/'));
+                    // Direct children; folders are implied by deeper files.
+                    let mut children: std::collections::BTreeMap<String, Option<u32>> = Default::default();
+                    self.with_state(|st| {
+                        for ((ser, p), data) in &st.files {
+                            let Some(rest) = p.strip_prefix(&prefix).filter(|_| ser == serial) else { continue };
+                            match rest.split_once('/') {
+                                Some((dir, _)) => children.entry(dir.to_owned()).or_insert(None),
+                                None => children.entry(rest.to_owned()).or_insert(Some(data.len() as u32)),
+                            };
+                        }
+                    });
+                    let mut resp = Vec::new();
+                    for (name, size) in children {
+                        let mode = if size.is_some() { 0o100644u32 } else { 0o040755 };
+                        resp.extend(b"DENT");
+                        resp.extend(mode.to_le_bytes());
+                        resp.extend(size.unwrap_or(4096).to_le_bytes());
+                        resp.extend(0u32.to_le_bytes());
+                        resp.extend((name.len() as u32).to_le_bytes());
+                        resp.extend(name.as_bytes());
+                    }
+                    resp.extend(b"DONE");
+                    resp.extend([0u8; 16]);
+                    s.write_all(&resp).await?;
+                }
+                b"RECV" => {
+                    let path = read_exact_string(s, len).await?;
+                    match self.file(serial, &path) {
+                        Some(data) => {
+                            let mut resp = Vec::new();
+                            for chunk in data.chunks(64 * 1024) {
+                                resp.extend(b"DATA");
+                                resp.extend((chunk.len() as u32).to_le_bytes());
+                                resp.extend(chunk);
+                            }
+                            resp.extend(b"DONE\0\0\0\0");
+                            s.write_all(&resp).await?;
+                        }
+                        None => {
+                            let msg = b"No such file or directory";
+                            let mut resp = b"FAIL".to_vec();
+                            resp.extend((msg.len() as u32).to_le_bytes());
+                            resp.extend(msg);
+                            s.write_all(&resp).await?;
+                        }
+                    }
+                }
                 _ => return Ok(()), // QUIT or garbage
             }
         }

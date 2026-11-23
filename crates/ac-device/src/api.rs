@@ -42,9 +42,15 @@ pub enum UiCommand {
     /// Grid tile's longest side in device pixels, for `max_size = "auto"`.
     SetTileSize { slot: SlotId, px: u32 },
     /// Send files and folders to each slot's phone (spec §5). APKs at the top
-    /// level are installed when `install_apks`, copied otherwise.
-    SendFiles { slots: Vec<SlotId>, paths: Vec<std::path::PathBuf>, install_apks: bool },
+    /// level are installed when `install_apks`, copied otherwise. Files go to
+    /// `target_dir` on the phone, or to `[transfer] default_target_dir`.
+    SendFiles { slots: Vec<SlotId>, paths: Vec<std::path::PathBuf>, install_apks: bool, target_dir: Option<String> },
+    /// Cancels the slot's sends and its receive.
     CancelTransfers { slot: SlotId },
+    /// List a folder on the phone; answered with `UiEvent::RemoteDir`.
+    ListRemote { slot: SlotId, path: String },
+    /// Copy files and folders from the phone into `dest` on this PC.
+    ReceiveFiles { slot: SlotId, items: Vec<RemoteItem>, dest: std::path::PathBuf },
     /// Keep the phone's screen on (never time out) or restore its timeout.
     SetStayAwake { slot: SlotId, on: bool },
     /// Settings changed in Preferences. Stream settings apply the next time
@@ -77,6 +83,26 @@ pub enum UiCommand {
     Confirm { id: u64, ok: bool },
     /// The window saved the frame asked for by `UiEvent::SaveFrame { request: Some(_) }`.
     FrameSaved { request: u64, error: Option<String> },
+}
+
+/// A file or folder on the phone, as listed by `UiCommand::ListRemote`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub is_dir: bool,
+    /// A symbolic link: it may lead to a folder or a file.
+    pub is_link: bool,
+    pub size: u64,
+    /// Unix seconds.
+    pub mtime: u64,
+}
+
+/// Something on the phone to receive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteItem {
+    /// Absolute path on the phone.
+    pub path: String,
+    pub is_dir: bool,
 }
 
 /// Something to do with an installed app, by package name.
@@ -279,6 +305,8 @@ pub enum UiEvent {
     /// How an app action (or an APK install) went on one phone.
     AppResult { slot: SlotId, kind: AppKind, ok: bool, message: String },
     Packages { slot: SlotId, packages: Vec<String> },
+    /// A folder on the phone (`UiCommand::ListRemote`), or why it can't be listed.
+    RemoteDir { slot: SlotId, path: String, entries: Result<Vec<RemoteEntry>, String> },
     /// An app crashed or stopped responding on the phone.
     Crash { slot: SlotId, crash: CrashView },
     Run(RunView),
@@ -322,6 +350,8 @@ pub struct TransferView {
     /// File being sent (the most recently started one).
     pub file: String,
     pub installing: bool,
+    /// Files coming from the phone (`UiCommand::ReceiveFiles`).
+    pub receiving: bool,
     /// 1-based position among `count` files.
     pub index: u32,
     pub count: u32,

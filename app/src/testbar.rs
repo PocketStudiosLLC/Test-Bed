@@ -235,7 +235,7 @@ impl TestBar {
                 return app.toast("No phone is connected");
             }
             app.clear_results();
-            app.send(UiCommand::SendFiles { slots, paths: vec![path], install_apks: true });
+            app.send(UiCommand::SendFiles { slots, paths: vec![path], install_apks: true, target_dir: None });
         });
         let w = weak.clone();
         bar.package.connect_changed(move |e| {

@@ -31,6 +31,7 @@ use crate::dnd::{self, ApkChoice};
 use crate::grid_layout::{Grid, TileInfo};
 use crate::mirror::{DeviceAction, InputPrefs, SlotInput, new_mirror};
 use crate::pairing::{Page, PairingDialog};
+use crate::phone_files::{self, PhoneFiles};
 use crate::slot_card::{CardAction, SlotCard};
 use crate::testbar::TestBar;
 use crate::texture;
@@ -153,6 +154,14 @@ pub struct App {
     /// Why config.toml could not be loaded; Preferences won't overwrite it.
     config_locked: Option<String>,
     transfers: RefCell<Vec<Option<TransferView>>>,
+    /// Each slot's receive from its phone, while one runs.
+    receives: RefCell<Vec<Option<TransferView>>>,
+    /// Per phone, this session: the folder on it that sent files go to
+    /// (`None`: `[transfer] default_target_dir`).
+    send_dirs: RefCell<Vec<Option<String>>>,
+    /// Per phone: the folder last browsed for receiving.
+    browse_dirs: RefCell<Vec<Option<String>>>,
+    phone_files: RefCell<Option<Rc<PhoneFiles>>>,
     /// "Remember for this session" answer of the APK question: install?
     apk_answer: Cell<Option<bool>>,
     // ---- app testing (Milestone 5) ----
@@ -472,6 +481,10 @@ pub fn build(
             config_path: restore.config_path.clone(),
             config_locked: config_error.clone(),
             transfers: RefCell::new(vec![None; slots as usize]),
+            receives: RefCell::new(vec![None; slots as usize]),
+            send_dirs: RefCell::new(vec![None; slots as usize]),
+            browse_dirs: RefCell::new(vec![None; slots as usize]),
+            phone_files: RefCell::new(None),
             apk_answer: Cell::new(None),
             test_bar: RefCell::new(None),
             recording: RefCell::new(vec![false; slots as usize]),
@@ -480,6 +493,7 @@ pub fn build(
             run_dir: RefCell::new(None),
         }
     });
+    app_rc.refresh_send_dirs();
     for i in 0..app_rc.cards.len() {
         let slot = i as SlotId + 1;
         app_rc.install_drop(slot, app_rc.cards[i].root.upcast_ref(), true);
@@ -954,6 +968,7 @@ impl App {
         self.broadcast.configure(&cfg.input);
         self.clipboard_autosync.set(cfg.input.clipboard_autosync);
         *self.transfer_cfg.borrow_mut() = cfg.transfer.clone();
+        self.refresh_send_dirs();
         crate::preferences::apply_color_scheme(&cfg.ui.color_scheme);
         self.send(UiCommand::UpdateConfig(Box::new(cfg.clone())));
         *self.config.borrow_mut() = cfg;
@@ -1033,6 +1048,8 @@ impl App {
                     self.toast("Start mirroring the phone to copy its clipboard");
                 }
             }
+            CardAction::ChooseSendDir => self.open_phone_files(slot, phone_files::Mode::SendDir),
+            CardAction::Receive => self.open_phone_files(slot, phone_files::Mode::Receive),
             CardAction::CancelTransfers => self.send(UiCommand::CancelTransfers { slot }),
             CardAction::Rename => self.ask_rename(slot),
             CardAction::UpdateHelper => self.send(UiCommand::UpdateHelper { slot }),
@@ -1256,11 +1273,19 @@ impl App {
             UiEvent::Transfer(v) => {
                 let i = v.slot as usize - 1;
                 let Some(card) = self.cards.get(i) else { return };
-                card.set_transfer(&v);
-                let was_active = self.transfers.borrow()[i].as_ref().is_some_and(|t| t.active);
-                self.transfers.borrow_mut()[i] = v.active.then_some(v.clone());
+                let list = if v.receiving { &self.receives } else { &self.transfers };
+                let was_active = list.borrow()[i].is_some();
+                list.borrow_mut()[i] = v.active.then_some(v.clone());
+                // One progress row: sending wins while both run.
+                let shown = self.transfers.borrow()[i].clone().or_else(|| self.receives.borrow()[i].clone());
+                card.set_transfer(shown.as_ref().unwrap_or(&v));
                 if was_active != v.active {
                     self.render_status();
+                }
+            }
+            UiEvent::RemoteDir { slot, path, entries } => {
+                if let Some(d) = self.phone_files(slot) {
+                    d.show_listing(&path, entries);
                 }
             }
         }
@@ -1502,7 +1527,7 @@ impl App {
                 let cfg = app.transfer_cfg.borrow();
                 let choice = dnd::apk_choice(&cfg.apk_drop_action, false);
                 Some(match t.value().map(|v| dnd::paths_from_value(&v)) {
-                    Some(Ok(paths)) => dnd::hint(&paths, &cfg.default_target_dir, choice, &cfg.apk_alternate_modifier, phones),
+                    Some(Ok(paths)) => dnd::hint(&paths, &app.send_dir(slot), choice, &cfg.apk_alternate_modifier, phones),
                     Some(Err(e)) => e,
                     None => "Drop to send".into(),
                 })
@@ -1573,16 +1598,18 @@ impl App {
         }
         let has_apk = paths.iter().any(|p| ac_transfer::apk::has_apk_ext(p));
         let choice = dnd::apk_choice(&self.transfer_cfg.borrow().apk_drop_action, alternate);
+        // The folder picked for the phone dropped on (also for broadcast targets).
+        let target_dir = self.send_dirs.borrow().get(slot as usize - 1).cloned().flatten();
         match (has_apk, choice, self.apk_answer.get()) {
-            (false, ..) => self.send(UiCommand::SendFiles { slots, paths, install_apks: false }),
-            (true, ApkChoice::Ask, Some(install)) => self.send(UiCommand::SendFiles { slots, paths, install_apks: install }),
-            (true, ApkChoice::Ask, None) => self.ask_apk(slots, paths),
-            (true, c, _) => self.send(UiCommand::SendFiles { slots, paths, install_apks: c == ApkChoice::Install }),
+            (false, ..) => self.send(UiCommand::SendFiles { slots, paths, install_apks: false, target_dir }),
+            (true, ApkChoice::Ask, Some(install)) => self.send(UiCommand::SendFiles { slots, paths, install_apks: install, target_dir }),
+            (true, ApkChoice::Ask, None) => self.ask_apk(slots, paths, target_dir),
+            (true, c, _) => self.send(UiCommand::SendFiles { slots, paths, install_apks: c == ApkChoice::Install, target_dir }),
         }
     }
 
     /// `apk_drop_action = "ask"`: Install / Copy as file / Cancel.
-    fn ask_apk(self: &Rc<Self>, slots: Vec<SlotId>, paths: Vec<PathBuf>) {
+    fn ask_apk(self: &Rc<Self>, slots: Vec<SlotId>, paths: Vec<PathBuf>, target_dir: Option<String>) {
         let n = paths.iter().filter(|p| ac_transfer::apk::has_apk_ext(p)).count();
         let alert = adw::AlertDialog::new(
             Some(if n == 1 { "Install this app?" } else { "Install these apps?" }),
@@ -1606,9 +1633,65 @@ impl App {
             if remember.is_active() {
                 app.apk_answer.set(Some(install));
             }
-            app.send(UiCommand::SendFiles { slots: slots.clone(), paths: paths.clone(), install_apks: install });
+            app.send(UiCommand::SendFiles { slots: slots.clone(), paths: paths.clone(), install_apks: install, target_dir: target_dir.clone() });
         });
         alert.present(Some(&self.window));
+    }
+
+    /// The folder on `slot`'s phone that sent files go to.
+    pub fn send_dir(&self, slot: SlotId) -> String {
+        self.send_dirs.borrow().get(slot as usize - 1).cloned().flatten().unwrap_or_else(|| self.transfer_cfg.borrow().default_target_dir.clone())
+    }
+
+    /// Tile menu → Folder on the Phone…: for this phone, this session.
+    pub fn set_send_dir(&self, slot: SlotId, dir: String) {
+        let default = dir == self.transfer_cfg.borrow().default_target_dir;
+        if let Some(d) = self.send_dirs.borrow_mut().get_mut(slot as usize - 1) {
+            *d = (!default).then(|| dir.clone());
+        }
+        self.refresh_send_dirs();
+        self.toast(&format!("Files sent to this phone now go to {dir}"));
+    }
+
+    fn refresh_send_dirs(&self) {
+        for (i, card) in self.cards.iter().enumerate() {
+            card.set_send_dir(&self.send_dir(i as SlotId + 1));
+        }
+    }
+
+    /// Tile menu → Receive from Phone… / Folder on the Phone….
+    fn open_phone_files(self: &Rc<Self>, slot: SlotId, mode: phone_files::Mode) {
+        let Some(v) = self.slot_view(slot).filter(|v| v.phase == PhaseView::Online) else {
+            self.toast("Connect this phone first");
+            return;
+        };
+        // Closing re-enters `phone_files_closed`: no borrow may be held.
+        let old = self.phone_files.borrow().clone();
+        if let Some(old) = old {
+            old.dialog.force_close();
+            self.phone_files.borrow_mut().take();
+        }
+        let start = match mode {
+            phone_files::Mode::Receive => self.browse_dirs.borrow().get(slot as usize - 1).cloned().flatten(),
+            phone_files::Mode::SendDir => Some(self.send_dir(slot)),
+        };
+        let dlg = PhoneFiles::new(self, slot, &v.title, mode, start);
+        dlg.dialog.present(Some(&self.window));
+        *self.phone_files.borrow_mut() = Some(dlg);
+    }
+
+    pub fn phone_files(&self, slot: SlotId) -> Option<Rc<PhoneFiles>> {
+        self.phone_files.borrow().clone().filter(|d| d.slot == slot)
+    }
+
+    pub fn phone_files_closed(&self, slot: SlotId) {
+        let Some(d) = self.phone_files(slot) else { return };
+        if d.mode() == phone_files::Mode::Receive
+            && let Some(b) = self.browse_dirs.borrow_mut().get_mut(slot as usize - 1)
+        {
+            *b = Some(d.path());
+        }
+        self.phone_files.borrow_mut().take();
     }
 
     /// Tile menu → Send Files… / Send Folder… (portal-backed on Wayland).
@@ -1980,6 +2063,10 @@ impl App {
         let sending = self.transfers.borrow().iter().flatten().count();
         if sending > 0 {
             line.push_str(&format!("  ·  ⇅ sending to {sending} phone{}", if sending == 1 { "" } else { "s" }));
+        }
+        let receiving = self.receives.borrow().iter().flatten().count();
+        if receiving > 0 {
+            line.push_str(&format!("  ·  ⇣ receiving from {receiving} phone{}", if receiving == 1 { "" } else { "s" }));
         }
         match self.automation_clients.get() {
             0 => {}

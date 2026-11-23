@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 ac-core.workspace = true
 ac-config.workspace = true
+directories.workspace = true
 ac-input.workspace = true
 ac-media.workspace = true
 ac-remote = { path = "../crates/ac-remote" }

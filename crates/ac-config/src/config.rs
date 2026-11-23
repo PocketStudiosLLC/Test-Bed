@@ -290,6 +290,9 @@ impl Default for Input {
 #[serde(default)]
 pub struct Transfer {
     pub default_target_dir: String,
+    /// Where files received from a phone go on this PC; empty means the
+    /// Downloads folder. `~/` is the home folder.
+    pub receive_dir: String,
     pub on_conflict: String,
     pub apk_drop_action: String,
     pub apk_alternate_modifier: String,
@@ -311,6 +314,7 @@ impl Default for Transfer {
     fn default() -> Self {
         Self {
             default_target_dir: "/sdcard/Download".into(),
+            receive_dir: String::new(),
             on_conflict: "rename".into(),
             apk_drop_action: "install".into(),
             apk_alternate_modifier: "shift".into(),

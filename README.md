@@ -124,7 +124,14 @@ Started in Milestone 4:
   videos and music are added to the gallery. A progress strip under the tile
   shows rate, ETA and a cancel button. While a phone is mirroring, its
   transfers are capped at 40 Mbit/s so video keeps up. In broadcast mode a
-  drop goes to every ticked phone.
+  drop goes to every ticked phone. *Folder on the Phone…* in the same menu
+  picks a different folder on that phone for this session.
+- **Receiving files**: the send button's *Receive from Phone…* browses the
+  phone's storage; tick files and folders (folders come with everything in
+  them) and choose where they go on this PC with *Change…* (remembered as
+  `transfer.receive_dir`, default `~/Downloads`). A name already on the PC
+  is handled by `transfer.on_conflict`. Needs a wireless-debugging (ADB)
+  connection: the helper alone can't read other apps' files.
 - **APK install**: a dropped `.apk` is installed (Shift+drop copies it
   instead; see `transfer.apk_drop_action`).
 

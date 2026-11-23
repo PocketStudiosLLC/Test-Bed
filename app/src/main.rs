@@ -14,6 +14,8 @@ mod pairing;
 #[cfg(windows)]
 mod pc_window;
 #[cfg(unix)]
+mod phone_files;
+#[cfg(unix)]
 mod preferences;
 #[cfg(unix)]
 mod qr;

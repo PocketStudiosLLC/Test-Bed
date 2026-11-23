@@ -227,6 +227,25 @@ fn files(ctx: &Ctx, cfg: &Config) -> adw::PreferencesPage {
     const VERIFY: &[(&str, &str)] = &[("large", "For files of 64 MB or more"), ("always", "Always"), ("never", "Never")];
     ctx.combo(&g, "Check files arrived intact", "Compares a checksum after sending", VERIFY, &cfg.transfer.verify_checksum, |c, v| c.transfer.verify_checksum = v.into());
 
+    let g = ctx.group(&p, "Receiving files", "From the phone's file menu: Receive from Phone…");
+    let default = ac_device::transfer::receive_root("");
+    let dir = adw::EntryRow::builder()
+        .title(format!("Folder on this PC (empty: {})", default.display()))
+        .text(&cfg.transfer.receive_dir)
+        .show_apply_button(true)
+        .build();
+    {
+        let ctx = ctx.clone();
+        dir.connect_apply(move |r| {
+            let text = r.text().trim().to_owned();
+            if ctx.change(|c| c.transfer.receive_dir = text.clone()) {
+                let shown = ac_device::transfer::receive_root(&text);
+                ctx.dialog.add_toast(adw::Toast::new(&format!("Received files now go to {}", shown.display())));
+            }
+        });
+    }
+    g.add(&dir);
+
     let g = ctx.group(&p, "Speed", "0 means no limit");
     ctx.spin(&g, "Limit while mirroring (Mbit/s)", "Keeps the phone's video smooth during a transfer", (0, 1000, 5), cfg.transfer.rate_limit_while_streaming_mbps, |c, v| c.transfer.rate_limit_while_streaming_mbps = v);
     ctx.spin(&g, "Limit otherwise (Mbit/s)", "", (0, 1000, 5), cfg.transfer.rate_limit_idle_mbps, |c, v| c.transfer.rate_limit_idle_mbps = v);

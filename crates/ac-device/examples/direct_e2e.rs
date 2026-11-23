@@ -35,7 +35,7 @@ async fn main() {
                     println!("tapped {}x{} at centre; frames so far {:?}", w, hh, h.io[0].mailbox.stats.decoded.load(std::sync::atomic::Ordering::Relaxed));
                     tapped = true;
                     if let Some(f) = args.get(3) {
-                        h.commands.send(UiCommand::SendFiles { slots: vec![1], paths: vec![f.into()], install_apks: true }).await.unwrap();
+                        h.commands.send(UiCommand::SendFiles { slots: vec![1], paths: vec![f.into()], install_apks: true, target_dir: None }).await.unwrap();
                     }
                     h.commands.send(UiCommand::SetStayAwake { slot: 1, on: true }).await.unwrap();
                 }

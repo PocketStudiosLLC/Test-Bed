@@ -1219,7 +1219,7 @@ Wireless debugging is encrypted."
         }
         let title = self.title(i);
         let device_id = d.id.clone();
-        self.transfers.submit(slot, device_id.clone(), title, vec![path], true);
+        self.transfers.submit(slot, device_id.clone(), title, vec![path], true, None);
         // Watch how it goes: a different signing key needs an extra step (spec2 §6).
         let mut results = self.transfers.install_results();
         self.spawn_msg(async move {
@@ -1891,20 +1891,28 @@ which resets its settings and its pairing for connections without ADB. Permissio
                 self.feed(slot, SlotEvent::SetProfile(profile));
             }
             UiCommand::RestartStream { slot } => self.feed(slot, SlotEvent::RestartStream),
-            UiCommand::SendFiles { slots, paths, install_apks } => {
+            UiCommand::SendFiles { slots, paths, install_apks, target_dir } => {
                 for slot in slots {
                     let Some(i) = self.idx(slot) else { continue };
                     let s = &self.slots[i];
                     match (&s.phase, s.device.as_ref()) {
                         (Phase::Online { .. }, Some(d)) => {
                             let title = self.views[i].as_ref().map_or_else(|| s.display_name(), |v| v.title.clone());
-                            self.transfers.submit(slot, d.id.clone(), title, paths.clone(), install_apks);
+                            self.transfers.submit(slot, d.id.clone(), title, paths.clone(), install_apks, target_dir.clone());
                         }
                         _ => self.toast(None, format!("Slot {slot} has no connected phone")),
                     }
                 }
             }
             UiCommand::CancelTransfers { slot } => self.transfers.cancel(slot),
+            UiCommand::ListRemote { slot, path } => self.transfers.list_remote(slot, path),
+            UiCommand::ReceiveFiles { slot, items, dest } => match self.idx(slot) {
+                Some(i) if matches!(self.slots[i].phase, Phase::Online { .. }) => {
+                    let title = self.title(i);
+                    self.transfers.receive(slot, title, items, dest);
+                }
+                _ => self.toast(None, format!("Slot {slot} has no connected phone")),
+            },
             UiCommand::UpdateConfig(cfg) => {
                 self.transfers.configure(cfg.transfer.clone());
                 // What the running tasks copied at start (ADB server, slot

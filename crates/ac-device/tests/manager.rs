@@ -561,3 +561,66 @@ async fn nothing_saved_means_nothing_to_do() {
     assert!(wait_done(&h).await.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn browse_and_receive_files_and_folders() {
+    let mock = MockAdb::start().await;
+    let addr = "192.168.1.43:37115";
+    mock.with_state(|s| {
+        s.connectable.insert(addr.into(), phone("SER9", "Pixel 9"));
+    });
+    let h = start(&mock);
+    h.commands.send(UiCommand::Connect { slot: None, addr: addr.into() }).await.unwrap();
+    wait_phase(&h, 1, PhaseView::Online).await;
+    let serial = mock.with_state(|s| s.devices.iter().find(|d| d.model == "Pixel 9").map(|d| d.serial.clone())).unwrap();
+    let big: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+    mock.with_state(|s| {
+        for (path, data) in [
+            ("/sdcard/notes.txt", b"hello".to_vec()),
+            ("/sdcard/DCIM/Camera/a.jpg", big.clone()),
+            ("/sdcard/DCIM/b.png", b"png".to_vec()),
+        ] {
+            s.files.insert((serial.clone(), path.into()), data);
+        }
+    });
+
+    h.commands.send(UiCommand::ListRemote { slot: 1, path: "/sdcard".into() }).await.unwrap();
+    let entries = wait_for(&h, "listing", |e| match e {
+        UiEvent::RemoteDir { slot: 1, entries, .. } => Some(entries.clone()),
+        _ => None,
+    })
+    .await
+    .expect("listed");
+    let names: Vec<_> = entries.iter().map(|e| (e.name.as_str(), e.is_dir)).collect();
+    assert_eq!(names, [("DCIM", true), ("notes.txt", false)]);
+
+    let dest = temp_dir("receive");
+    std::fs::write(dest.join("notes.txt"), b"mine").unwrap();
+    let items = vec![
+        RemoteItem { path: "/sdcard/DCIM".into(), is_dir: true },
+        RemoteItem { path: "/sdcard/notes.txt".into(), is_dir: false },
+    ];
+    h.commands.send(UiCommand::ReceiveFiles { slot: 1, items, dest: dest.clone() }).await.unwrap();
+    let message = wait_for(&h, "saved", |e| match e {
+        UiEvent::Saved { message, .. } => Some(message.clone()),
+        UiEvent::Toast { message, .. } if message.contains("receiv") => panic!("{message}"),
+        _ => None,
+    })
+    .await;
+    assert!(message.starts_with("3 files received from Pixel 9"), "{message}");
+    assert_eq!(std::fs::read(dest.join("DCIM/Camera/a.jpg")).unwrap(), big);
+    assert_eq!(std::fs::read(dest.join("DCIM/b.png")).unwrap(), b"png");
+    // The default on_conflict ("rename") keeps the PC's own file.
+    assert_eq!(std::fs::read(dest.join("notes.txt")).unwrap(), b"mine");
+    assert_eq!(std::fs::read(dest.join("notes (1).txt")).unwrap(), b"hello");
+    assert!(std::fs::read_dir(dest.join("DCIM")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".part")));
+
+    h.commands.send(UiCommand::ListRemote { slot: 1, path: "/sdcard/Nope".into() }).await.unwrap();
+    let err = wait_for(&h, "missing folder", |e| match e {
+        UiEvent::RemoteDir { slot: 1, path, entries } if path == "/sdcard/Nope" => Some(entries.clone()),
+        _ => None,
+    })
+    .await
+    .unwrap_err();
+    assert!(err.contains("no folder"), "{err}");
+}
